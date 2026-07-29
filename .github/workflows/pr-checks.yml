@@ -1,0 +1,36 @@
+name: PR Checks
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-install-scripts:
+    name: New install-script dependencies
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so the PR base commit and its lockfiles are
+          # readable via `git show <base-sha>:<path>`.
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run checker unit tests
+        run: |
+          pip install --quiet -r requirements.txt
+          python -m pytest tests/test_check_new_install_scripts.py -q
+
+      - name: Check for newly introduced dependencies with install scripts
+        env:
+          # The actual PR base commit, not a branch name.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/check_new_install_scripts.py --base "$BASE_SHA"
