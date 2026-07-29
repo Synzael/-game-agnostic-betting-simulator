@@ -8,6 +8,10 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import { SessionResult } from "@/engine/types";
+import {
+  createLegacyGameSnapshot,
+  migrateLegacyBetRecords,
+} from "@/engine/games";
 
 export interface HistoryStats {
   totalSessions: number;
@@ -71,16 +75,40 @@ export function calculateHistoryStats(sessions: SessionResult[]): HistoryStats {
   };
 }
 
+export function migrateLegacySessionResult(
+  session: SessionResult
+): SessionResult {
+  if (session.game) return session;
+  const game = createLegacyGameSnapshot();
+  return {
+    ...session,
+    game,
+    betHistory: session.betHistory
+      ? migrateLegacyBetRecords(session.betHistory, game)
+      : session.betHistory,
+  };
+}
+
 export const useHistoryStore = create<HistoryStore>()(
   persist(
     (set, get) => ({
       sessions: [],
 
       addSession: (result) => {
-        set((state) => ({
-          // Keep last 100 sessions, newest first
-          sessions: [result, ...state.sessions].slice(0, 100),
-        }));
+        set((state) => {
+          const existingIndex = state.sessions.findIndex(
+            (session) => session.id === result.id
+          );
+          if (existingIndex >= 0) {
+            const sessions = [...state.sessions];
+            sessions[existingIndex] = result;
+            return { sessions };
+          }
+          return {
+            // Keep last 100 sessions, newest first
+            sessions: [result, ...state.sessions].slice(0, 100),
+          };
+        });
       },
 
       removeSession: (id) => {
@@ -107,7 +135,16 @@ export const useHistoryStore = create<HistoryStore>()(
     }),
     {
       name: "betting-history:v1",
+      version: 2,
       storage: createJSONStorage(() => localStorage),
+      migrate: (persistedState, version) => {
+        if (version >= 2) return persistedState as HistoryStore;
+        const legacy = persistedState as Partial<HistoryStore>;
+        return {
+          ...legacy,
+          sessions: (legacy.sessions ?? []).map(migrateLegacySessionResult),
+        } as HistoryStore;
+      },
     }
   )
 );

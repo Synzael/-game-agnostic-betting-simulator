@@ -6,6 +6,7 @@ import {
   canAffordStake,
   exceedsTableMax,
   processBet,
+  processOutcome,
   processBridgingDecision,
   getProfitProgress,
   getStopLossProgress,
@@ -14,7 +15,9 @@ import {
   getLadderName,
 } from './session';
 import { createLadder } from './ladder';
+import { createGameSnapshot } from './games';
 import {
+  BridgingDecision,
   SessionState,
   SessionConfig,
   StrategyConfig,
@@ -465,6 +468,65 @@ describe('processBet', () => {
       expect(newState.recoveryTargetPnl).toBe(0);
       expect(newState.currentLadder).toBe(0);
       expect(newState.currentIndex).toBe(0);
+    });
+
+    it('exits recovery on a push once the target is already met', () => {
+      const config = createTestConfig();
+      const strategy = createTestStrategy();
+      const game = createGameSnapshot('baccarat_standard_8_deck', 'banker_5pct_commission');
+      const state: SessionState = {
+        ...createInitialState(strategy),
+        currentLadder: 1,
+        currentIndex: 2,
+        inRecovery: true,
+        // Already satisfied, as after carrying over while in profit.
+        recoveryTargetPnl: -50,
+        pnl: -20,
+      };
+
+      // A tie settles to zero and holds the ladder, but must not strand the
+      // player in recovery when the mark has already been reached.
+      const newState = processOutcome(
+        state,
+        config,
+        strategy,
+        game,
+        'tie',
+        'at_bridging_only'
+      );
+
+      expect(newState.pnl).toBe(-20);
+      expect(newState.rounds).toBe(1);
+      expect(newState.inRecovery).toBe(false);
+      expect(newState.currentLadder).toBe(0);
+      expect(newState.currentIndex).toBe(0);
+    });
+
+    it('holds ladder position on a push while recovery is unmet', () => {
+      const config = createTestConfig();
+      const strategy = createTestStrategy();
+      const game = createGameSnapshot('baccarat_standard_8_deck', 'banker_5pct_commission');
+      const state: SessionState = {
+        ...createInitialState(strategy),
+        currentLadder: 1,
+        currentIndex: 2,
+        inRecovery: true,
+        recoveryTargetPnl: -50,
+        pnl: -80,
+      };
+
+      const newState = processOutcome(
+        state,
+        config,
+        strategy,
+        game,
+        'tie',
+        'at_bridging_only'
+      );
+
+      expect(newState.inRecovery).toBe(true);
+      expect(newState.currentLadder).toBe(1);
+      expect(newState.currentIndex).toBe(2);
     });
   });
 });

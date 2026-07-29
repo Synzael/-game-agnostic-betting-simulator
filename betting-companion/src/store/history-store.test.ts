@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useHistoryStore } from './history-store';
+import {
+  migrateLegacySessionResult,
+  useHistoryStore,
+} from './history-store';
 import { SessionResult, SessionConfig, StrategyConfig } from '@/engine/types';
 import { createLadder } from '@/engine/ladder';
 
@@ -85,6 +88,31 @@ describe('useHistoryStore', () => {
       expect(sessions.length).toBe(100);
       // Most recent should be first
       expect(sessions[0].id).toBe('session-104');
+    });
+
+    it('replaces the same result id when a late forecast snapshot arrives', () => {
+      const session = createTestSessionResult({ id: 'same' });
+      useHistoryStore.getState().addSession(session);
+      useHistoryStore.getState().addSession({
+        ...session,
+        forecastSnapshot: {
+          points: [],
+          sampleCount: 10,
+          seed: 1,
+          engineVersion: 'test',
+          inputFingerprint: 'input',
+          anchorScheduleVersion: 1,
+          terminalHandling: 'absorbing_final_pnl',
+          quantileEstimator: 'r7_linear',
+          gameFingerprint: 'game',
+          generatedAt: 1,
+          quality: 'full',
+        },
+      });
+      expect(useHistoryStore.getState().sessions).toHaveLength(1);
+      expect(
+        useHistoryStore.getState().sessions[0].forecastSnapshot?.sampleCount
+      ).toBe(10);
     });
   });
 
@@ -276,5 +304,41 @@ describe('useHistoryStore', () => {
       expect(stats.bestSession).toBe(500);
       expect(stats.worstSession).toBe(-400);
     });
+  });
+});
+
+describe('legacy history migration', () => {
+  it('freezes a legacy game and preserves the exact recorded pnl deltas', () => {
+    const migrated = migrateLegacySessionResult(
+      createTestSessionResult({
+        finalPnl: 2.5,
+        betHistory: [
+          {
+            round: 1,
+            timestamp: 1,
+            ladder: 0,
+            index: 0,
+            stake: 5,
+            won: true,
+            pnlAfter: 5,
+          },
+          {
+            round: 2,
+            timestamp: 2,
+            ladder: 0,
+            index: 0,
+            stake: 5,
+            won: false,
+            pnlAfter: 2.5,
+          },
+        ],
+      })
+    );
+    expect(migrated.game?.gameId).toBe('legacy_even_money');
+    expect(migrated.betHistory?.map((bet) => bet.settledPnl)).toEqual([
+      5,
+      -2.5,
+    ]);
+    expect(migrated.finalPnl).toBe(2.5);
   });
 });

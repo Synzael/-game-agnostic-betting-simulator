@@ -1,6 +1,12 @@
 "use client";
 
-import { BetRecord, SessionEvent, StopReason } from "@/engine/types";
+import { useId } from "react";
+import {
+  BetRecord,
+  SessionEvent,
+  StopReason,
+  VarianceForecast,
+} from "@/engine/types";
 import { formatStake } from "@/engine";
 import { buildGraphModel } from "./graph-model";
 
@@ -8,6 +14,8 @@ interface SessionGraphProps {
   readonly betHistory: readonly BetRecord[];
   readonly events?: readonly SessionEvent[];
   readonly stopReason?: StopReason;
+  readonly varianceForecast?: VarianceForecast | null;
+  readonly showVarianceFan?: boolean;
   readonly showBetNumbers: boolean;
   readonly height?: number;
   readonly className?: string;
@@ -29,20 +37,31 @@ const STOP_REASON_COLORS: Record<NonNullable<StopReason>, string> = {
   max_rounds: "var(--amber)",
 };
 
+const OUTCOME_COLORS = {
+  win: "var(--emerald)",
+  loss: "var(--crimson)",
+  neutral: "#94a3b8",
+} as const;
+
 export function SessionGraph({
   betHistory,
   events = [],
   stopReason = null,
+  varianceForecast = null,
+  showVarianceFan = true,
   showBetNumbers,
   height = 110,
   className,
 }: SessionGraphProps) {
+  const clipId = `fan-clip-${useId().replace(/:/g, "")}`;
   const model = buildGraphModel(
     betHistory,
     events,
     stopReason,
     VIRTUAL_WIDTH,
-    height
+    height,
+    varianceForecast?.points,
+    showVarianceFan
   );
 
   const pnlLabel = model.isEmpty
@@ -60,6 +79,57 @@ export function SessionGraph({
       className={className}
       data-testid="session-graph"
     >
+      <defs>
+        <clipPath id={clipId}>
+          <rect x={12} y={16} width={VIRTUAL_WIDTH - 24} height={height - 32} />
+        </clipPath>
+        <pattern
+          id={`${clipId}-pattern`}
+          width="6"
+          height="6"
+          patternUnits="userSpaceOnUse"
+        >
+          <path
+            d="M 0 6 L 6 0"
+            stroke="var(--gold)"
+            strokeWidth="0.5"
+            opacity="0.18"
+          />
+        </pattern>
+      </defs>
+
+      {model.variance && (
+        <g clipPath={`url(#${clipId})`} data-testid="variance-fan">
+          <path
+            d={model.variance.outerBandPath}
+            fill={`url(#${clipId}-pattern)`}
+            stroke="var(--gold-dim)"
+            strokeWidth={0.7}
+            strokeDasharray="3 3"
+            opacity={0.62}
+            vectorEffect="non-scaling-stroke"
+            data-testid="variance-outer"
+          />
+          <path
+            d={model.variance.innerBandPath}
+            fill="var(--gold)"
+            stroke="none"
+            opacity={0.12}
+            data-testid="variance-inner"
+          />
+          <polyline
+            points={model.variance.medianPoints}
+            fill="none"
+            stroke="var(--champagne)"
+            strokeWidth={0.9}
+            strokeDasharray="5 4"
+            opacity={0.75}
+            vectorEffect="non-scaling-stroke"
+            data-testid="variance-median"
+          />
+        </g>
+      )}
+
       {/* Zero baseline */}
       <line
         x1={0}
@@ -69,6 +139,7 @@ export function SessionGraph({
         stroke="var(--noir-border)"
         strokeWidth={1}
         strokeDasharray="3 4"
+        vectorEffect="non-scaling-stroke"
       />
 
       {model.isEmpty ? (
@@ -113,27 +184,39 @@ export function SessionGraph({
             points={model.linePoints}
             fill="none"
             stroke="var(--gold)"
-            strokeWidth={1.5}
+            strokeWidth={2}
             strokeLinejoin="round"
             strokeLinecap="round"
+            vectorEffect="non-scaling-stroke"
           />
 
-          {/* Win/loss dots with optional stake labels */}
+          {/* Typed outcome dots with optional stake labels */}
           {model.dots.map((dot) => (
             <g key={`dot-${dot.round}`}>
               <circle
                 cx={dot.x}
                 cy={dot.y}
                 r={2.5}
-                fill={dot.won ? "var(--emerald)" : "var(--crimson)"}
+                fill={OUTCOME_COLORS[dot.progressionEffect]}
+                stroke={
+                  dot.progressionEffect === "neutral"
+                    ? "var(--champagne)"
+                    : "none"
+                }
+                strokeWidth={dot.progressionEffect === "neutral" ? 0.8 : 0}
+                data-testid={`outcome-${dot.progressionEffect}`}
               />
               {showBetNumbers && dot.showLabel && (
                 <text
                   x={dot.x}
-                  y={dot.won ? dot.y - 6 : dot.y + 12}
+                  y={
+                    dot.progressionEffect === "win"
+                      ? dot.y - 6
+                      : dot.y + 12
+                  }
                   textAnchor="middle"
                   fontSize={8}
-                  fill={dot.won ? "var(--emerald)" : "var(--crimson)"}
+                  fill={OUTCOME_COLORS[dot.progressionEffect]}
                   data-testid="stake-label"
                 >
                   {formatStake(dot.stake)}

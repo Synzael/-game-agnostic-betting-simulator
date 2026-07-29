@@ -231,6 +231,17 @@ body::before {
   box-shadow: 0 6px 32px rgba(220, 38, 38, 0.4);
 }
 
+.btn-neutral {
+  background: linear-gradient(135deg, #334155 0%, #475569 50%, #64748b 100%);
+  color: white;
+  border: 1px solid #94a3b8;
+  box-shadow: 0 4px 24px rgba(100, 116, 139, 0.2);
+}
+
+.btn-neutral:hover {
+  filter: brightness(1.1);
+}
+
 .btn-ghost {
   background: transparent;
   color: var(--text-secondary);
@@ -521,6 +532,137 @@ body::before {
     var(--gold-dim) 80%,
     transparent 100%
   );
+}
+
+/* ============================================
+   Vault Trophy Case
+   ============================================ */
+
+.vault-emblem {
+  width: 54px;
+  height: 54px;
+  display: grid;
+  place-items: center;
+  color: var(--noir);
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  background: var(--gradient-gold);
+  border: 1px solid var(--champagne);
+  box-shadow:
+    0 0 0 4px var(--noir),
+    0 0 0 5px var(--gold-dim),
+    var(--shadow-gold);
+  transform: rotate(45deg);
+}
+
+.vault-emblem span {
+  transform: rotate(-45deg);
+}
+
+.vault-trophy {
+  position: relative;
+  min-height: 390px;
+  width: 100%;
+  padding: 22px;
+  overflow: hidden;
+  border: 1px solid var(--gold-dim);
+  border-radius: 4px 24px 4px 24px;
+  color: var(--text-primary);
+  background:
+    radial-gradient(circle at 50% 0%, rgba(212, 175, 55, 0.12), transparent 36%),
+    linear-gradient(145deg, #1b1a1d 0%, #0c0c10 52%, #17151a 100%);
+  box-shadow:
+    inset 0 0 0 5px var(--noir),
+    inset 0 0 0 6px rgba(166, 138, 42, 0.32),
+    var(--shadow-elevated);
+}
+
+.vault-trophy::before,
+.vault-trophy::after {
+  content: "";
+  position: absolute;
+  width: 110px;
+  height: 110px;
+  border: 1px solid rgba(212, 175, 55, 0.25);
+  transform: rotate(45deg);
+  pointer-events: none;
+}
+
+.vault-trophy::before {
+  top: -82px;
+  left: -54px;
+}
+
+.vault-trophy::after {
+  right: -54px;
+  bottom: -82px;
+}
+
+.vault-trophy-filled {
+  cursor: pointer;
+  transition:
+    transform 220ms var(--ease-smooth),
+    border-color 220ms var(--ease-smooth),
+    box-shadow 220ms var(--ease-smooth);
+}
+
+.vault-trophy-filled:hover,
+.vault-trophy-filled:focus-visible {
+  border-color: var(--gold);
+  transform: translateY(-4px);
+  box-shadow:
+    inset 0 0 0 5px var(--noir),
+    inset 0 0 0 6px rgba(212, 175, 55, 0.5),
+    0 14px 38px rgba(0, 0, 0, 0.65),
+    var(--shadow-gold);
+  outline: none;
+}
+
+.vault-trophy-empty {
+  border-color: var(--noir-border);
+  opacity: 0.78;
+}
+
+.vault-trophy-longest_survival {
+  background:
+    radial-gradient(circle at 50% 0%, rgba(245, 158, 11, 0.1), transparent 36%),
+    linear-gradient(145deg, #1c1917 0%, #0c0c10 52%, #171512 100%);
+}
+
+.vault-trophy-perfect_run {
+  background:
+    radial-gradient(circle at 50% 0%, rgba(16, 185, 129, 0.1), transparent 36%),
+    linear-gradient(145deg, #151c19 0%, #0c0c10 52%, #121916 100%);
+}
+
+.vault-corner {
+  position: absolute;
+  top: 13px;
+  width: 18px;
+  height: 18px;
+  border-top: 1px solid var(--gold-dim);
+  pointer-events: none;
+}
+
+.vault-corner-left {
+  left: 13px;
+  border-left: 1px solid var(--gold-dim);
+}
+
+.vault-corner-right {
+  right: 13px;
+  border-right: 1px solid var(--gold-dim);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vault-trophy-filled {
+    transition: none;
+  }
+
+  .vault-trophy-filled:hover,
+  .vault-trophy-filled:focus-visible {
+    transform: none;
+  }
 }
 
 /* ============================================

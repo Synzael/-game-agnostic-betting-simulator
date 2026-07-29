@@ -2,24 +2,35 @@
 
 import { useRouter } from "next/navigation";
 import { useSessionStore } from "@/store";
-import { formatStake } from "@/engine";
-import { BridgingDecision } from "@/engine/types";
+import { formatStake, processBridgingDecision } from "@/engine";
+import { BridgingDecision, FrozenGameSnapshot } from "@/engine/types";
 import { AdventureGraph } from "@/components/graph";
+import {
+  DecisionGhostViewState,
+  useDecisionGhosts,
+} from "./useDecisionGhosts";
 
 export function DecisionScreen() {
   const router = useRouter();
   const state = useSessionStore((s) => s.state);
+  const config = useSessionStore((s) => s.config);
   const strategy = useSessionStore((s) => s.strategy);
+  const game = useSessionStore((s) => s.game);
   const makeDecision = useSessionStore((s) => s.makeDecision);
+  const ghosts = useDecisionGhosts(state, config, strategy, game);
 
-  if (!state || !strategy || !state.awaitingDecision) {
+  if (!state || !config || !strategy || !game || !state.awaitingDecision) {
     return null;
   }
 
-  // Calculate what recovery target would be
-  const potentialRecoveryTarget = state.pnl < 0
-    ? state.pnl + Math.abs(state.pnl) * strategy.recoveryTargetPct
-    : state.pnl;
+  // Derive display values through the production transition so commission
+  // cents and canonical rounding cannot drift from the simulation.
+  const potentialCarryState = processBridgingDecision(
+    state,
+    strategy,
+    "carry_over"
+  );
+  const potentialRecoveryTarget = potentialCarryState.recoveryTargetPnl;
 
   const nextLadderIndex = state.currentLadder + 1;
   const hasNextLadder = nextLadderIndex < strategy.ladders.length;
@@ -84,6 +95,8 @@ export function DecisionScreen() {
         </div>
       </div>
 
+      <DecisionGhostStatus ghosts={ghosts} round={state.rounds} />
+
       {/* Decision Cards - Roguelike Style */}
       <div className="space-y-4">
         {/* Carry Over */}
@@ -114,6 +127,11 @@ export function DecisionScreen() {
                     Reach target to reset to L1
                   </div>
                 </div>
+                <GhostBranchMetrics
+                  ghosts={ghosts}
+                  branch="carry_over"
+                  recoveryTarget={potentialRecoveryTarget}
+                />
               </div>
             </div>
           </button>
@@ -146,6 +164,11 @@ export function DecisionScreen() {
                   Fresh start from bottom
                 </div>
               </div>
+              <GhostBranchMetrics
+                ghosts={ghosts}
+                branch="write_off"
+                currentPnl={state.pnl}
+              />
             </div>
           </div>
         </button>
@@ -177,10 +200,192 @@ export function DecisionScreen() {
                   Session complete
                 </div>
               </div>
+              <div className="mt-4 border-t border-white/10 pt-3">
+                <div className="text-[10px] uppercase tracking-[0.14em] text-[var(--crimson)]">
+                  Exact outcome
+                </div>
+                <div className="mt-1 text-sm text-champagne">
+                  Ends now at {formatStake(state.pnl)}
+                </div>
+              </div>
             </div>
           </div>
         </button>
       </div>
+
+      <details className="card-noir mt-5 px-4 py-3 text-xs text-secondary">
+        <summary className="cursor-pointer text-champagne">
+          How these futures are modeled
+        </summary>
+        <div className="mt-3 space-y-2 leading-relaxed">
+          <p>
+            Each choice uses matched, local Monte Carlo paths from round{" "}
+            {state.rounds} and the exact P&amp;L, ladder, recovery state, bankroll,
+            target, and stop loss shown here.
+          </p>
+          <p>
+            Assumption:{" "}
+            {describeModelledGame(ghosts.forecast?.game ?? game)}. Later bridge
+            points follow the frozen strategy policy.
+          </p>
+          <p>
+            Simulations are estimates, not guarantees, and do not change the
+            house edge. No choice is automatically recommended.
+          </p>
+        </div>
+      </details>
     </div>
   );
+}
+
+function DecisionGhostStatus({
+  ghosts,
+  round,
+}: {
+  ghosts: DecisionGhostViewState;
+  round: number;
+}) {
+  const statusText = (() => {
+    switch (ghosts.status) {
+      case "loading":
+        return `Reading ${ghosts.completedSamples.toLocaleString()} of ${ghosts.totalSamples.toLocaleString()} matched futures…`;
+      case "preview":
+        return `Preview from ${ghosts.forecast?.sampleCount.toLocaleString()} paths · refining ${ghosts.completedSamples.toLocaleString()} / ${ghosts.totalSamples.toLocaleString()}`;
+      case "ready":
+        return `${ghosts.forecast?.sampleCount.toLocaleString()} matched paths from round ${round}`;
+      case "error":
+        return "Forecast unavailable — choices still work";
+      default:
+        return "Preparing futures…";
+    }
+  })();
+
+  return (
+    <div
+      className="card-gold p-4 mb-5 animate-fadeInUp stagger-2"
+      role="status"
+      aria-live="polite"
+      data-testid="decision-ghost-status"
+    >
+      <div className="flex items-center gap-3">
+        <div className="w-9 h-9 rounded-full bg-[var(--gold-glow)] border border-[var(--gold-dim)] flex items-center justify-center">
+          <svg
+            className="w-5 h-5 text-gold"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={1.5}
+              d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"
+            />
+            <circle cx="12" cy="12" r="2.5" strokeWidth={1.5} />
+          </svg>
+        </div>
+        <div>
+          <div className="text-[10px] text-gold uppercase tracking-[0.18em]">
+            Decision Ghosts
+          </div>
+          <div className="text-xs text-secondary mt-0.5">{statusText}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GhostBranchMetrics({
+  ghosts,
+  branch,
+  recoveryTarget,
+  currentPnl,
+}: {
+  ghosts: DecisionGhostViewState;
+  branch: "carry_over" | "write_off";
+  recoveryTarget?: number;
+  currentPnl?: number;
+}) {
+  if (ghosts.status === "error") {
+    return (
+      <div className="mt-4 border-t border-white/10 pt-3 text-xs text-secondary">
+        Forecast unavailable. You can still choose this path.
+      </div>
+    );
+  }
+
+  if (!ghosts.forecast) {
+    return (
+      <div
+        className="mt-4 border-t border-white/10 pt-3 space-y-2"
+        aria-label="Forecast loading"
+      >
+        <div className="h-3 w-3/4 rounded bg-white/10 animate-pulse" />
+        <div className="h-3 w-2/3 rounded bg-white/10 animate-pulse" />
+      </div>
+    );
+  }
+
+  if (branch === "carry_over") {
+    const forecast = ghosts.forecast.carryOver;
+    return (
+      <div
+        className="mt-4 border-t border-white/10 pt-3"
+        data-testid="carry-over-ghost"
+      >
+        <div className="text-[10px] uppercase tracking-[0.14em] text-[var(--emerald)]">
+          Ghost forecast
+        </div>
+        <div className="mt-1 text-sm text-champagne">
+          {formatProbability(forecast.probReachRecoveryMark ?? 0)} recover to{" "}
+          {formatStake(recoveryTarget ?? 0)}
+        </div>
+        <div className="mt-1 text-xs text-secondary">
+          Median further drop{" "}
+          {formatStake(forecast.medianAdditionalDrawdown)}
+        </div>
+      </div>
+    );
+  }
+
+  const forecast = ghosts.forecast.writeOff;
+  return (
+    <div
+      className="mt-4 border-t border-white/10 pt-3"
+      data-testid="write-off-ghost"
+    >
+      <div className="text-[10px] uppercase tracking-[0.14em] text-[var(--amber)]">
+        Ghost forecast
+      </div>
+      <div className="mt-1 text-sm text-champagne">
+        {formatProbability(forecast.probHitTarget)} reach the session target
+      </div>
+      <div className="mt-1 text-xs text-secondary">
+        Current P&amp;L stays {formatStake(currentPnl ?? 0)}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Names the game the forecast actually simulated. Falls back to the session's
+ * own frozen snapshot while loading or after a worker error, so the disclosure
+ * can never describe a different game than the one being played.
+ */
+function describeModelledGame(
+  game: FrozenGameSnapshot | null | undefined
+): string {
+  if (!game) return "the session's frozen game model";
+  return `${game.gameDisplayName} · ${game.betVariant.displayName}`;
+}
+
+/**
+ * Rounding alone would report a rare outcome as impossible and a near-certain
+ * one as guaranteed. Only an exact 0 or 1 may be shown as such.
+ */
+function formatProbability(probability: number): string {
+  if (probability > 0 && probability < 0.005) return "<1%";
+  if (probability < 1 && probability > 0.995) return ">99%";
+  return `${Math.round(probability * 100)}%`;
 }

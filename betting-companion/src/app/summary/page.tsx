@@ -1,30 +1,80 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { useSessionStore, useHistoryStore } from "@/store";
+import { useSessionStore, useHistoryStore, useVaultStore } from "@/store";
 import { Button } from "@/components/ui";
 import { formatStake, getStopReasonText, isWinningSession } from "@/engine";
+import { TrophyCategory } from "@/engine/types";
 import { AdventureGraph } from "@/components/graph";
+import { NewVaultRecord } from "@/components/vault";
 
 export default function SummaryPage() {
   const router = useRouter();
   const state = useSessionStore((s) => s.state);
   const config = useSessionStore((s) => s.config);
+  const completedResult = useSessionStore((s) => s.completedResult);
+  const game = useSessionStore((s) => s.game);
   const endSession = useSessionStore((s) => s.endSession);
   const resetSession = useSessionStore((s) => s.resetSession);
+  const historySessions = useHistoryStore((s) => s.sessions);
   const addSession = useHistoryStore((s) => s.addSession);
+  const initializeVault = useVaultStore((s) => s.initializeFromHistory);
+  const evaluateSession = useVaultStore((s) => s.evaluateSession);
+  const consumeReveal = useVaultStore((s) => s.consumeReveal);
+  const pendingRevealsBySessionId = useVaultStore(
+    (s) => s.pendingRevealsBySessionId
+  );
+  const vaultPersistenceError = useVaultStore((s) => s.persistenceError);
+  const completionHandled = useRef(false);
+  const [newVaultRecords, setNewVaultRecords] = useState<
+    readonly TrophyCategory[]
+  >([]);
 
-  // Save to history on mount
+  // Complete once across Strict Mode replays and safely deduplicate across
+  // remounts with the cached SessionResult ID.
   useEffect(() => {
-    if (state?.stopped) {
-      const result = endSession();
-      if (result) {
-        addSession(result);
-      }
+    if (!state?.stopped || completionHandled.current) return;
+
+    const result = endSession();
+    if (!result) return;
+    completionHandled.current = true;
+
+    initializeVault(historySessions);
+    addSession(result);
+    evaluateSession(result);
+  }, [
+    state?.stopped,
+    endSession,
+    historySessions,
+    initializeVault,
+    addSession,
+    evaluateSession,
+  ]);
+
+  // A forecast can finish after the terminal result is first written. Replace
+  // the same history ID with its completed compact snapshot when that happens.
+  useEffect(() => {
+    if (completedResult?.forecastSnapshot) {
+      addSession(completedResult);
     }
-  }, [state?.stopped, endSession, addSession]);
+  }, [completedResult, addSession]);
+
+  // Copy the persisted pending reveal into page-local state, then consume it.
+  // The timer keeps the effect synchronized without a cascading render and
+  // remains safe under Strict Mode's setup/cleanup replay.
+  useEffect(() => {
+    if (!completedResult) return;
+    const categories = pendingRevealsBySessionId[completedResult.id];
+    if (!categories || categories.length === 0) return;
+
+    const timer = window.setTimeout(() => {
+      setNewVaultRecords(categories);
+      consumeReveal(completedResult.id);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [completedResult, consumeReveal, pendingRevealsBySessionId]);
 
   // Redirect if no session
   if (!state || !config) {
@@ -108,12 +158,33 @@ export default function SummaryPage() {
 
       {/* Stats */}
       <div className="max-w-md mx-auto space-y-4">
+        <NewVaultRecord categories={newVaultRecords} />
+
+        {vaultPersistenceError && (
+          <div
+            role="status"
+            className="rounded-xl border border-[var(--amber)] bg-[var(--amber-glow)] p-4 text-sm leading-6 text-secondary"
+          >
+            {vaultPersistenceError}
+          </div>
+        )}
+
         <div className="card-noir p-5 animate-fadeInUp stagger-1">
           <h2 className="text-[10px] text-muted uppercase tracking-[0.15em] mb-4">
             Session Summary
           </h2>
           <div className="space-y-3">
             <StatRow label="Rounds Played" value={state.rounds.toString()} />
+            {game && (
+              <StatRow
+                label="Game"
+                value={`${game.gameDisplayName} · ${game.betVariant.displayName}`}
+              />
+            )}
+            <StatRow
+              label="Win / Loss / Push"
+              value={`${state.winCount ?? 0} / ${state.lossCount ?? 0} / ${state.pushCount ?? 0}`}
+            />
             <StatRow
               label="Total Wagered"
               value={formatStake(state.totalWagered)}

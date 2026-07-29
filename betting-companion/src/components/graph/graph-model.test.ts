@@ -130,6 +130,44 @@ describe('buildGraphModel', () => {
     });
   });
 
+  describe('variance fan geometry', () => {
+    const forecast = [
+      { round: 0, p05: 0, p25: 0, p50: 0, p75: 0, p95: 0 },
+      { round: 2, p05: -100, p25: -20, p50: 0, p75: 20, p95: 100 },
+    ];
+
+    it('builds closed outer/inner paths and a median from shared transforms', () => {
+      const model = buildGraphModel(
+        [makeBet(1, true, 10, 10), makeBet(2, false, 10, 0)],
+        [],
+        null,
+        WIDTH,
+        HEIGHT,
+        forecast,
+        true
+      );
+      expect(model.variance?.outerBandPath.startsWith('M ')).toBe(true);
+      expect(model.variance?.outerBandPath.endsWith(' Z')).toBe(true);
+      expect(model.variance?.innerBandPath.endsWith(' Z')).toBe(true);
+      expect(model.variance?.medianPoints.split(' ')).toHaveLength(2);
+      // The actual +$10 point remains inside the domain expanded to fan P95.
+      expect(model.dots[0].y).toBeGreaterThan(16);
+    });
+
+    it('omits geometry when the display setting hides the snapshot', () => {
+      const model = buildGraphModel(
+        [makeBet(1, true, 10, 10), makeBet(2, false, 10, 0)],
+        [],
+        null,
+        WIDTH,
+        HEIGHT,
+        forecast,
+        false
+      );
+      expect(model.variance).toBeNull();
+    });
+  });
+
   describe('stake label thinning', () => {
     it('labels every dot for short sessions', () => {
       const bets = Array.from({ length: 10 }, (_, i) =>

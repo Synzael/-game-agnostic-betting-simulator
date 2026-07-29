@@ -30,6 +30,61 @@ export interface StrategyConfig {
 }
 
 /**
+ * How a settled game outcome moves the staking ladder.
+ */
+export type ProgressionEffect = "win" | "loss" | "neutral";
+
+/**
+ * A declarative game outcome. `netPayoutMultiplier` is net P&L divided by
+ * stake, not the amount returned including the original stake.
+ */
+export interface GameOutcomeSpec {
+  readonly id: string;
+  readonly displayName: string;
+  readonly probability: number;
+  readonly netPayoutMultiplier: number;
+  readonly progressionEffect: ProgressionEffect;
+}
+
+export interface BetVariantSpec {
+  readonly id: string;
+  readonly displayName: string;
+  readonly outcomes: readonly GameOutcomeSpec[];
+  readonly settlementVersion: number;
+  readonly roundingRule: "nearest_cent_half_away_from_zero";
+}
+
+export interface GameSpec {
+  readonly id: string;
+  readonly version: number;
+  readonly displayName: string;
+  readonly description: string;
+  readonly betVariants: readonly BetVariantSpec[];
+  readonly assumptions: string;
+}
+
+/**
+ * The complete game/variant definition frozen into a session. Registry
+ * updates cannot change settlement or replay for an active or old session.
+ */
+export interface FrozenGameSnapshot {
+  readonly gameId: string;
+  readonly gameVersion: number;
+  readonly gameDisplayName: string;
+  readonly gameDescription: string;
+  readonly assumptions: string;
+  readonly betVariant: BetVariantSpec;
+  readonly fingerprint: string;
+}
+
+export interface RecordedOutcome {
+  readonly gameId: string;
+  readonly gameVersion: number;
+  readonly betVariantId: string;
+  readonly outcomeId: string;
+}
+
+/**
  * Session configuration.
  */
 export interface SessionConfig {
@@ -79,6 +134,11 @@ export interface SessionState {
   maxDrawdown: number;
   peakPnl: number;
 
+  // Outcome statistics
+  winCount: number;
+  lossCount: number;
+  pushCount: number;
+
   // Ladder statistics
   ladderTouches: Record<number, number>;
   topTouches: number;
@@ -119,8 +179,39 @@ export interface BetRecord {
   readonly ladder: number;
   readonly index: number;
   readonly stake: number;
-  readonly won: boolean;
+  /**
+   * Compatibility evidence for v1 histories. New records use `outcome`,
+   * `progressionEffect`, and exact `settledPnl`.
+   */
+  readonly won?: boolean;
+  readonly outcome?: RecordedOutcome;
+  readonly outcomeDisplayName?: string;
+  readonly progressionEffect?: ProgressionEffect;
+  readonly settledPnl?: number;
   readonly pnlAfter: number;
+}
+
+export interface VarianceBandPoint {
+  readonly round: number;
+  readonly p05: number;
+  readonly p25: number;
+  readonly p50: number;
+  readonly p75: number;
+  readonly p95: number;
+}
+
+export interface VarianceForecast {
+  readonly points: readonly VarianceBandPoint[];
+  readonly sampleCount: number;
+  readonly seed: number;
+  readonly engineVersion: string;
+  readonly inputFingerprint: string;
+  readonly anchorScheduleVersion: number;
+  readonly terminalHandling: "absorbing_final_pnl";
+  readonly quantileEstimator: "r7_linear";
+  readonly gameFingerprint: string;
+  readonly generatedAt: number;
+  readonly quality: "preview" | "full";
 }
 
 /**
@@ -155,12 +246,41 @@ export interface SessionResult {
   // Configuration snapshot
   readonly config: SessionConfig;
   readonly strategy: StrategyConfig;
+  readonly game?: FrozenGameSnapshot;
 
   // Bet history (optional, for replay)
   readonly betHistory?: readonly BetRecord[];
 
   // Bridging decision events (optional, for adventure graph)
   readonly events?: readonly SessionEvent[];
+
+  // Compact pre-session modeled range used by history/ledger views.
+  readonly forecastSnapshot?: VarianceForecast;
+}
+
+/**
+ * Categories preserved independently from ordinary session history.
+ */
+export type TrophyCategory =
+  | "biggest_comeback"
+  | "longest_survival"
+  | "perfect_run";
+
+export interface TrophyEvidence {
+  readonly metric: number | boolean;
+  readonly facts: Readonly<Record<string, number | string | boolean>>;
+  readonly rulesVersion: number;
+}
+
+export interface VaultSessionSnapshot {
+  readonly session: SessionResult;
+  readonly preservedAt: number;
+}
+
+export interface TrophySlot {
+  readonly category: TrophyCategory;
+  readonly sessionId: string;
+  readonly evidence: TrophyEvidence;
 }
 
 /**

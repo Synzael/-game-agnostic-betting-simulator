@@ -3,10 +3,17 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { useSessionStore, useSettingsStore } from "@/store";
+import {
+  useCustomPresetStore,
+  useSessionStore,
+  useSettingsStore,
+} from "@/store";
 import { Button, Card, NumberInput, Toggle } from "@/components/ui";
 import {
+  createGameSnapshot,
   getAllPresets,
+  getAllGames,
+  expectedReturnPerUnit,
   createStrategyFromPreset,
   DEFAULT_SESSION_CONFIG,
   SessionConfig,
@@ -14,6 +21,7 @@ import {
   DEFAULT_LADDERS,
   formatStake,
 } from "@/engine";
+import type { SavedOptimizerPreset } from "@/engine/optimizer";
 
 interface SetupValidationErrors {
   bankroll?: string;
@@ -50,6 +58,20 @@ export default function SetupPage() {
   const setShowBetNumbers = useSettingsStore((s) => s.setShowBetNumbers);
 
   const presets = getAllPresets();
+  const customPresets = useCustomPresetStore((state) => state.presets);
+  const games = getAllGames();
+  const [selectedGameId, setSelectedGameId] = useState<string>(
+    games[0].id
+  );
+  const selectedGame =
+    games.find((game) => game.id === selectedGameId) ?? games[0];
+  const [selectedVariantId, setSelectedVariantId] = useState<string>(
+    selectedGame.betVariants[0].id
+  );
+  const selectedVariant =
+    selectedGame.betVariants.find(
+      (variant) => variant.id === selectedVariantId
+    ) ?? selectedGame.betVariants[0];
   const [selectedPreset, setSelectedPreset] = useState<string>("default");
   const [showWarningModal, setShowWarningModal] = useState(false);
   const [config, setConfig] = useState<SessionConfig>({
@@ -59,6 +81,26 @@ export default function SetupPage() {
 
   const validationErrors = validateSessionConfig(config);
   const hasValidationErrors = Object.keys(validationErrors).length > 0;
+
+  /**
+   * A Lab preset's feasibility was confirmed against one specific objective and
+   * game. Starting it under different settings does not reshape the ladder, so
+   * the confirmed ruin bound would no longer describe what the user is running.
+   */
+  const presetMatchesCurrentSettings = (
+    preset: SavedOptimizerPreset
+  ): boolean => {
+    const { objective, gameFingerprint } = preset.provenance;
+    return (
+      gameFingerprint ===
+        createGameSnapshot(selectedGame.id, selectedVariant.id).fingerprint &&
+      objective.bankroll === config.bankroll &&
+      objective.profitTarget === config.profitTarget &&
+      objective.stopLossAbs === config.stopLossAbs &&
+      objective.maxRounds === config.maxRounds &&
+      (objective.tableMax ?? null) === (config.tableMax ?? null)
+    );
+  };
 
   const handlePresetSelect = (preset: PresetConfig) => {
     setSelectedPreset(preset.name);
@@ -75,8 +117,14 @@ export default function SetupPage() {
   };
 
   const confirmStartSession = () => {
-    const strategy = createStrategyFromPreset(selectedPreset);
-    startSession(config, strategy);
+    const custom = customPresets.find(
+      (preset) => preset.id === selectedPreset
+    );
+    const strategy = custom
+      ? structuredClone(custom.strategy)
+      : createStrategyFromPreset(selectedPreset);
+    const game = createGameSnapshot(selectedGame.id, selectedVariant.id);
+    startSession(config, strategy, game);
     setShowWarningModal(false);
     router.push("/session");
   };
@@ -98,6 +146,103 @@ export default function SetupPage() {
       </div>
 
       <div className="max-w-md mx-auto space-y-6">
+        {/* Game Selection */}
+        <div>
+          <h2 className="text-sm text-slate-400 uppercase tracking-wide mb-3">
+            Game
+          </h2>
+          <div className="grid grid-cols-1 gap-2">
+            {games.map((game) => (
+              <Card
+                key={game.id}
+                variant={selectedGame.id === game.id ? "info" : "default"}
+                interactive
+                selected={selectedGame.id === game.id}
+                className="p-3"
+                onClick={() => {
+                  setSelectedGameId(game.id);
+                  setSelectedVariantId(game.betVariants[0].id);
+                }}
+              >
+                <div className="font-medium text-white text-sm">
+                  {game.displayName}
+                </div>
+                <div className="text-xs text-slate-400 mt-1">
+                  {game.description}
+                </div>
+              </Card>
+            ))}
+          </div>
+        </div>
+
+        {selectedGame.betVariants.length > 1 && (
+          <div>
+            <h2 className="text-sm text-slate-400 uppercase tracking-wide mb-3">
+              Bet Variant
+            </h2>
+            <div className="grid grid-cols-1 gap-2">
+              {selectedGame.betVariants.map((variant) => (
+                <Card
+                  key={variant.id}
+                  variant={
+                    selectedVariant.id === variant.id ? "info" : "default"
+                  }
+                  interactive
+                  selected={selectedVariant.id === variant.id}
+                  className="p-3"
+                  onClick={() => setSelectedVariantId(variant.id)}
+                >
+                  <div className="font-medium text-white text-sm">
+                    {variant.displayName}
+                  </div>
+                </Card>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <Card className="p-4">
+          <div className="text-xs text-slate-300">
+            {selectedVariant.outcomes.map((outcome) => (
+              <div
+                key={outcome.id}
+                className="flex justify-between gap-3 py-1"
+              >
+                <span>{outcome.displayName}</span>
+                <span className="text-slate-400 text-right">
+                  {(outcome.probability * 100).toFixed(2)}% ·{" "}
+                  {outcome.netPayoutMultiplier > 0 ? "+" : ""}
+                  {outcome.netPayoutMultiplier}:1 net
+                </span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 border-t border-slate-700 pt-3 text-xs text-slate-400">
+            Theoretical return:{" "}
+            <span
+              className={
+                expectedReturnPerUnit(
+                  createGameSnapshot(selectedGame.id, selectedVariant.id)
+                ) < 0
+                  ? "text-red-400"
+                  : "text-amber-300"
+              }
+            >
+              {(
+                expectedReturnPerUnit(
+                  createGameSnapshot(selectedGame.id, selectedVariant.id)
+                ) * 100
+              ).toFixed(3)}
+              % per unit wagered
+            </span>
+            <p className="mt-2">{selectedGame.assumptions}</p>
+            <p className="mt-2">
+              Game modules model settlement rules; they do not turn a
+              negative-EV wager into a profitable one.
+            </p>
+          </div>
+        </Card>
+
         {/* Preset Selection */}
         <div>
           <h2 className="text-sm text-slate-400 uppercase tracking-wide mb-3">
@@ -123,8 +268,50 @@ export default function SetupPage() {
             ))}
           </div>
           <p className="text-xs text-slate-500 mt-2">
-            {presets.find((p) => p.name === selectedPreset)?.description}
+            {(() => {
+              const custom = customPresets.find(
+                (preset) => preset.id === selectedPreset
+              );
+              if (!custom) {
+                return presets.find((p) => p.name === selectedPreset)
+                  ?.description;
+              }
+              return presetMatchesCurrentSettings(custom)
+                ? "Versioned Ladder Lab result with saved optimizer provenance."
+                : "Confirmed under a different game or session settings, so its ruin bound does not describe this setup.";
+            })()}
           </p>
+          {customPresets.length > 0 && (
+            <>
+              <h3 className="mt-4 mb-2 text-xs uppercase tracking-wide text-slate-500">
+                Custom Lab Presets
+              </h3>
+              <div className="grid grid-cols-2 gap-2">
+                {customPresets.map((preset) => (
+                  <Card
+                    key={preset.id}
+                    variant={
+                      selectedPreset === preset.id ? "info" : "default"
+                    }
+                    interactive
+                    selected={selectedPreset === preset.id}
+                    className="p-3"
+                    onClick={() => setSelectedPreset(preset.id)}
+                  >
+                    <div className="font-medium text-white text-sm">
+                      {preset.displayName}
+                    </div>
+                    <div className="text-xs text-slate-400 mt-1">
+                      v{preset.version} ·{" "}
+                      {presetMatchesCurrentSettings(preset)
+                        ? "confirmed"
+                        : "confirmed for other settings"}
+                    </div>
+                  </Card>
+                ))}
+              </div>
+            </>
+          )}
         </div>
 
         {/* Session Configuration */}
@@ -278,9 +465,9 @@ export default function SetupPage() {
               Warning
             </div>
             <p className="text-pink-50 font-semibold leading-relaxed">
-              Warning: USE ONLY on games with house edge under 1.5% ideally under 1%.
-              Every tiny bit higher than 1% adds up QUICK with this strategy.
-              
+              Every ladder remains exposed to the selected game&apos;s
+              assumptions and variance. A modeled range or optimized shape
+              cannot remove a house edge.
             </p>
             <div className="mt-5 grid grid-cols-2 gap-2">
               <Button

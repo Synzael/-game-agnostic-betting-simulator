@@ -14,8 +14,17 @@ import {
   StrategyConfig,
   BridgingDecision,
   StopReason,
+  FrozenGameSnapshot,
+  RecordedOutcome,
+  ProgressionEffect,
 } from "./types";
-import { getStake, getMaxIndex, isAtTop } from "./ladder";
+import { getStake, getMaxIndex } from "./ladder";
+import {
+  createDefaultGameSnapshot,
+  resolveOutcomeSpec,
+  settleOutcome,
+} from "./games";
+import { addMoney, subtractMoney, toMinorUnits } from "./money";
 
 /**
  * Create initial session state.
@@ -44,6 +53,9 @@ export function createInitialState(
     maxStake: 0,
     maxDrawdown: 0,
     peakPnl: 0,
+    winCount: 0,
+    lossCount: 0,
+    pushCount: 0,
     ladderTouches,
     topTouches: 0,
     stopped: false,
@@ -73,7 +85,7 @@ export function getCurrentBankroll(
   state: SessionState,
   config: SessionConfig
 ): number {
-  return config.bankroll + state.pnl;
+  return addMoney(config.bankroll, state.pnl);
 }
 
 /**
@@ -101,7 +113,7 @@ export function exceedsTableMax(
 }
 
 /**
- * Process a bet result (win or loss).
+ * Compatibility adapter for v1 boolean inputs.
  * Returns new state - does NOT mutate input.
  */
 export function processBet(
@@ -109,6 +121,28 @@ export function processBet(
   config: SessionConfig,
   strategy: StrategyConfig,
   won: boolean,
+  decisionMode: "at_bridging_only" | "every_bet"
+): SessionState {
+  const game = createDefaultGameSnapshot();
+  return processOutcome(
+    state,
+    config,
+    strategy,
+    game,
+    won ? "win" : "loss",
+    decisionMode
+  );
+}
+
+/**
+ * Process a typed outcome resolved against the session's frozen game snapshot.
+ */
+export function processOutcome(
+  state: SessionState,
+  config: SessionConfig,
+  strategy: StrategyConfig,
+  game: FrozenGameSnapshot,
+  recordedOutcome: RecordedOutcome | string,
   decisionMode: "at_bridging_only" | "every_bet"
 ): SessionState {
   // Can't process if stopped or awaiting decision
@@ -136,16 +170,23 @@ export function processBet(
     };
   }
 
-  // Calculate PnL change
-  const roundPnl = won ? stake : -stake;
+  const outcome = resolveOutcomeSpec(game, recordedOutcome);
+  const roundPnl = settleOutcome(stake, game, recordedOutcome);
+  const settledPnl = addMoney(state.pnl, roundPnl);
 
   // Create new state with bet result
   let newState: SessionState = {
     ...state,
-    pnl: state.pnl + roundPnl,
+    pnl: settledPnl,
     rounds: state.rounds + 1,
-    totalWagered: state.totalWagered + stake,
+    totalWagered: addMoney(state.totalWagered, stake),
     maxStake: Math.max(state.maxStake, stake),
+    winCount:
+      (state.winCount ?? 0) + Number(outcome.progressionEffect === "win"),
+    lossCount:
+      (state.lossCount ?? 0) + Number(outcome.progressionEffect === "loss"),
+    pushCount:
+      (state.pushCount ?? 0) + Number(outcome.progressionEffect === "neutral"),
     ladderTouches: {
       ...state.ladderTouches,
       [state.currentLadder]: state.ladderTouches[state.currentLadder] + 1,
@@ -156,15 +197,18 @@ export function processBet(
   newState = {
     ...newState,
     peakPnl: Math.max(newState.peakPnl, newState.pnl),
-    maxDrawdown: Math.max(newState.maxDrawdown, newState.peakPnl - newState.pnl),
+    maxDrawdown: Math.max(
+      newState.maxDrawdown,
+      subtractMoney(newState.peakPnl, newState.pnl)
+    ),
   };
 
   // Check session stop conditions
-  if (newState.pnl >= config.profitTarget) {
+  if (toMinorUnits(newState.pnl) >= toMinorUnits(config.profitTarget)) {
     return { ...newState, stopped: true, stopReason: "profit_target" };
   }
 
-  if (-newState.pnl >= config.stopLossAbs) {
+  if (-toMinorUnits(newState.pnl) >= toMinorUnits(config.stopLossAbs)) {
     return { ...newState, stopped: true, stopReason: "stop_loss" };
   }
 
@@ -173,7 +217,7 @@ export function processBet(
   }
 
   // Step the ladder index
-  newState = stepIndex(newState, strategy, won);
+  newState = stepIndex(newState, strategy, outcome.progressionEffect);
 
   // Handle every-bet decision mode
   if (
@@ -203,17 +247,28 @@ export function processBet(
 function stepIndex(
   state: SessionState,
   strategy: StrategyConfig,
-  won: boolean
+  progressionEffect: ProgressionEffect
 ): SessionState {
+  if (progressionEffect === "neutral") {
+    // A push holds the ladder position, but a recovery target that is already
+    // met must still be released — otherwise a run of ties strands the player
+    // on the escalated ladder that any win or loss would have exited.
+    return completeRecoveryIfReached(state);
+  }
+
   const currentLadder = strategy.ladders[state.currentLadder];
   const maxIndex = getMaxIndex(currentLadder);
   const atTopBeforeStep = state.currentIndex >= maxIndex;
 
   // Calculate new index
-  let newIndex = won ? state.currentIndex - 2 : state.currentIndex + 1;
+  let newIndex =
+    progressionEffect === "win"
+      ? state.currentIndex - 2
+      : state.currentIndex + 1;
 
   // Check if bridging is needed (lost at top)
-  const needsBridging = !won && atTopBeforeStep;
+  const needsBridging =
+    progressionEffect === "loss" && atTopBeforeStep;
 
   if (needsBridging) {
     return handleBridging(state, strategy);
@@ -222,20 +277,21 @@ function stepIndex(
   // Normal stepping - clamp to valid range
   newIndex = Math.max(0, Math.min(newIndex, maxIndex));
 
-  let newState: SessionState = { ...state, currentIndex: newIndex };
+  return completeRecoveryIfReached({ ...state, currentIndex: newIndex });
+}
 
-  // Check for recovery completion
-  if (newState.inRecovery && newState.pnl >= newState.recoveryTargetPnl) {
-    newState = {
-      ...newState,
+/** Release recovery once the tracked mark is reached, resetting to ladder 0. */
+function completeRecoveryIfReached(state: SessionState): SessionState {
+  if (state.inRecovery && state.pnl >= state.recoveryTargetPnl) {
+    return {
+      ...state,
       inRecovery: false,
       recoveryTargetPnl: 0,
       currentLadder: 0,
       currentIndex: 0,
     };
   }
-
-  return newState;
+  return state;
 }
 
 /**
@@ -249,7 +305,7 @@ function handleBridging(
   const atLastLadder = state.currentLadder === strategy.ladders.length - 1;
 
   // Track top touch
-  let newState: SessionState = { ...state, topTouches: state.topTouches + 1 };
+  const newState: SessionState = { ...state, topTouches: state.topTouches + 1 };
 
   // If using stop_at_table_limit policy, just stop
   if (strategy.bridgingPolicy === "stop_at_table_limit") {
@@ -340,13 +396,63 @@ export function processBridgingDecision(
 }
 
 /**
+ * Resolve a simulation bridge from the configured policy without pausing for
+ * human input. Production live sessions continue to use explicit decisions.
+ */
+export function processAutomatedBridge(
+  state: SessionState,
+  strategy: StrategyConfig
+): SessionState {
+  if (
+    !state.awaitingDecision ||
+    state.pendingDecisionType !== "bridging"
+  ) {
+    return state;
+  }
+
+  if (strategy.bridgingPolicy === "stop_at_table_limit") {
+    return {
+      ...state,
+      stopped: true,
+      stopReason: "table_limit",
+      awaitingDecision: false,
+      pendingDecisionType: null,
+    };
+  }
+
+  const atLastLadder =
+    state.currentLadder === strategy.ladders.length - 1;
+  if (atLastLadder) {
+    return {
+      ...state,
+      stopped: true,
+      stopReason: "table_limit",
+      awaitingDecision: false,
+      pendingDecisionType: null,
+    };
+  }
+
+  if (strategy.bridgingPolicy === "advance_to_next_ladder_start") {
+    return {
+      ...state,
+      currentLadder: state.currentLadder + 1,
+      currentIndex: 0,
+      awaitingDecision: false,
+      pendingDecisionType: null,
+    };
+  }
+
+  return executeCarryOver(state, strategy);
+}
+
+/**
  * Execute carry over bridging logic.
  */
 function executeCarryOver(
   state: SessionState,
   strategy: StrategyConfig
 ): SessionState {
-  let newState = { ...state };
+  const newState = { ...state };
 
   // Enter recovery mode if not already in it
   if (!newState.inRecovery) {
@@ -354,7 +460,7 @@ function executeCarryOver(
 
     if (newState.pnl < 0) {
       const recoveryAmount = Math.abs(newState.pnl) * strategy.recoveryTargetPct;
-      newState.recoveryTargetPnl = newState.pnl + recoveryAmount;
+      newState.recoveryTargetPnl = addMoney(newState.pnl, recoveryAmount);
     } else {
       // Edge case: in profit, no recovery needed
       newState.recoveryTargetPnl = newState.pnl;
