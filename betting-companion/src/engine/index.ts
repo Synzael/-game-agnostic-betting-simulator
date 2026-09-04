@@ -78,6 +78,22 @@ export {
   DEFAULT_SESSION_CONFIG,
 } from "./presets";
 
+// Effective session plan shared by Setup preview and session creation
+export type {
+  SessionPlan,
+  SessionPlanSource,
+  SessionPlanAdjustment,
+  SessionPlanProvenance,
+  SessionPlanResolution,
+  ProvenanceMismatch,
+  ResolveSessionPlanInput,
+} from "./session-plan";
+export {
+  resolveSessionPlan,
+  configFromPresetProvenance,
+  findRegisteredGameByFingerprint,
+} from "./session-plan";
+
 // Session engine
 export {
   createInitialState,

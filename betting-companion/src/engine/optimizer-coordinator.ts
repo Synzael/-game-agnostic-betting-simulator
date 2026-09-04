@@ -7,18 +7,23 @@ import {
   generateEvolutionaryCandidates,
   generateGridCandidates,
   OPTIMIZER_ENGINE_VERSION,
-  OPTIMIZER_GRID_THRESHOLD,
   rankOptimizerEvaluations,
   validateOptimizerInput,
-  estimateSearchCardinality,
   type OptimizerCandidate,
   type OptimizerEvaluation,
   type OptimizerJobInput,
   type OptimizerResult,
 } from "./optimizer";
 import {
+  algorithmForInput,
+  OPTIMIZER_CHECKPOINT_SCHEMA_VERSION,
   saveOptimizerCheckpoint,
+  seedBankFingerprints,
+  type OptimizerAlgorithm,
   type OptimizerCheckpoint,
+  type OptimizerCheckpointStatus,
+  type OptimizerEvolutionState,
+  type OptimizerStage,
 } from "./optimizer-storage";
 import type {
   OptimizerWorkerRequest,
@@ -45,18 +50,31 @@ function mergeCandidates(
 }
 
 export interface OptimizerProgress {
-  readonly stage: "exploration" | "confirmation" | "complete";
+  readonly stage: OptimizerStage;
+  /** Candidates with a committed evaluation in the current stage. */
   readonly evaluated: number;
+  /** Candidates the current stage will evaluate in total. */
   readonly total: number;
   readonly activeComputeMs: number;
   readonly best: OptimizerEvaluation | null;
   readonly storageError: string | null;
+  /** Evolutionary search position, null for grid search and confirmation. */
+  readonly evolution: OptimizerEvolutionState | null;
+}
+
+/** What the durable checkpoint currently reflects. */
+export interface OptimizerPersistenceState {
+  readonly status: "unsaved" | "saving" | "saved" | "failed";
+  readonly updatedAt: number | null;
+  readonly error: string | null;
+  /** Committed evaluations across both stages in the last saved checkpoint. */
+  readonly savedEvaluations: number;
 }
 
 export interface OptimizerRunSummary {
   readonly jobId: string;
   readonly inputFingerprint: string;
-  readonly algorithm: "grid" | "evolutionary";
+  readonly algorithm: OptimizerAlgorithm;
   readonly exploration: readonly OptimizerEvaluation[];
   readonly confirmation: readonly OptimizerEvaluation[];
   readonly results: readonly OptimizerResult[];
@@ -69,14 +87,17 @@ export interface OptimizerCoordinatorCallbacks {
   readonly onStatus?: (
     status: "running" | "paused" | "cancelled" | "complete" | "failed"
   ) => void;
+  readonly onPersistence?: (state: OptimizerPersistenceState) => void;
 }
 
 export class OptimizerCoordinator {
   readonly input: OptimizerJobInput;
   readonly inputFingerprint: string;
   readonly jobId: string;
+  readonly algorithm: OptimizerAlgorithm;
 
   private readonly callbacks: OptimizerCoordinatorCallbacks;
+  private readonly seedBanks: ReturnType<typeof seedBankFingerprints>;
   private workers: Worker[] = [];
   private paused = false;
   private cancelled = false;
@@ -84,7 +105,14 @@ export class OptimizerCoordinator {
   private activeComputeMs = 0;
   private activeStartedAt = 0;
   private storageError: string | null = null;
+  private persistence: OptimizerPersistenceState = {
+    status: "unsaved",
+    updatedAt: null,
+    error: null,
+    savedEvaluations: 0,
+  };
   private checkpoint: OptimizerCheckpoint | null = null;
+  private evolution: OptimizerEvolutionState | null = null;
   private stageSequence = 0;
   private persistInFlight: Promise<void> | null = null;
   private queuedCheckpoint: OptimizerCheckpoint | null = null;
@@ -100,6 +128,8 @@ export class OptimizerCoordinator {
     this.callbacks = callbacks;
     this.inputFingerprint = createOptimizerInputFingerprint(input);
     this.jobId = jobId;
+    this.algorithm = algorithmForInput(input);
+    this.seedBanks = seedBankFingerprints(input);
   }
 
   pause(): void {
@@ -153,26 +183,22 @@ export class OptimizerCoordinator {
     }
   }
 
+  /** Resolves once every queued checkpoint write has settled. */
+  settled(): Promise<void> {
+    return this.flushPendingPersist();
+  }
+
   async run(
     resumeFrom?: OptimizerCheckpoint
   ): Promise<OptimizerRunSummary> {
     if (typeof Worker === "undefined") {
       throw new Error("Ladder Lab requires Web Worker support");
     }
-    if (
-      resumeFrom &&
-      (resumeFrom.inputFingerprint !== this.inputFingerprint ||
-        resumeFrom.jobId !== this.jobId)
-    ) {
-      throw new Error("Checkpoint does not match this optimizer job");
-    }
+    if (resumeFrom) this.assertResumable(resumeFrom);
 
     this.callbacks.onStatus?.("running");
-    this.startActiveClock();
-    const cardinality = estimateSearchCardinality(this.input.searchSpace);
-    const algorithm =
-      cardinality <= OPTIMIZER_GRID_THRESHOLD ? "grid" : "evolutionary";
-    let candidates = resumeFrom?.candidates.length
+    const algorithm = this.algorithm;
+    let candidates: OptimizerCandidate[] = resumeFrom?.candidates.length
       ? [...resumeFrom.candidates]
       : algorithm === "grid"
         ? generateGridCandidates(this.input)
@@ -189,51 +215,58 @@ export class OptimizerCoordinator {
     let confirmation = [...(resumeFrom?.confirmation ?? [])];
     this.activeComputeMs = resumeFrom?.activeComputeMs ?? 0;
     this.startActiveClock();
-    this.checkpoint = {
-      jobId: this.jobId,
-      inputFingerprint: this.inputFingerprint,
-      input: this.input,
-      algorithm,
-      stage: "exploration",
+    this.evolution = resumeFrom?.evolution ?? null;
+    this.checkpoint = this.buildCheckpoint({
+      stage: resumeFrom?.stage ?? "exploration",
       status: "running",
       candidates,
       exploration,
       confirmation,
-      activeComputeMs: this.currentActiveComputeMs(),
-      updatedAt: Date.now(),
-    };
+    });
 
     try {
       this.createWorkers();
-      if (resumeFrom?.stage !== "confirmation" && resumeFrom?.stage !== "complete") {
+      const explorationPending =
+        resumeFrom?.stage !== "confirmation" && resumeFrom?.stage !== "complete";
+      if (explorationPending) {
         const explorationSeeds = createSeedBank(
           this.input.seed,
           this.input.explorationSamples,
           "exploration"
         );
-        if (algorithm === "evolutionary" && !resumeFrom) {
-          let population = candidates;
+        if (algorithm === "evolutionary") {
+          const startGeneration = resumeFrom?.evolution?.generation ?? 0;
+          let population: OptimizerCandidate[] = resumeFrom?.evolution
+            ? this.resolvePopulation(resumeFrom)
+            : candidates;
           for (
-            let generation = 0;
+            let generation = startGeneration;
             generation < EVOLUTION_GENERATIONS;
             generation += 1
           ) {
+            this.evolution = {
+              generation,
+              generationCount: EVOLUTION_GENERATIONS,
+              populationSize: EVOLUTION_POPULATION,
+              population: population.map((candidate) => candidate.fingerprint),
+            };
             candidates = mergeCandidates(candidates, population);
             exploration = await this.evaluateStage(
               population,
               explorationSeeds,
               "exploration",
               exploration,
-              algorithm,
               candidates,
               confirmation
             );
-            population = evolveCandidatePopulation(
-              this.input,
-              exploration,
-              generation,
-              EVOLUTION_POPULATION
-            );
+            if (generation + 1 < EVOLUTION_GENERATIONS) {
+              population = evolveCandidatePopulation(
+                this.input,
+                exploration,
+                generation,
+                EVOLUTION_POPULATION
+              );
+            }
           }
         } else {
           exploration = await this.evaluateStage(
@@ -241,13 +274,14 @@ export class OptimizerCoordinator {
             explorationSeeds,
             "exploration",
             exploration,
-            algorithm,
             candidates,
             confirmation
           );
         }
       }
 
+      // Generation state is only meaningful while exploring.
+      this.evolution = null;
       const finalists = rankOptimizerEvaluations(exploration)
         .slice(0, FINALIST_COUNT)
         .map((evaluation) => evaluation.candidate);
@@ -261,7 +295,6 @@ export class OptimizerCoordinator {
           ),
           "confirmation",
           confirmation,
-          algorithm,
           candidates,
           exploration
         );
@@ -292,15 +325,14 @@ export class OptimizerCoordinator {
         feasibleResults: results.filter((result) => result.feasible),
         activeComputeMs: this.activeComputeMs,
       };
-      this.checkpoint = {
-        ...this.checkpoint,
+      this.checkpoint = this.buildCheckpoint({
         stage: "complete",
         status: "complete",
+        candidates,
         exploration,
         confirmation: rankedConfirmation,
-        activeComputeMs: this.activeComputeMs,
-        updatedAt: Date.now(),
-      };
+      });
+      await this.flushPendingPersist();
       await this.persist(this.checkpoint);
       this.callbacks.onProgress?.({
         stage: "complete",
@@ -309,6 +341,7 @@ export class OptimizerCoordinator {
         activeComputeMs: this.activeComputeMs,
         best: rankedConfirmation[0] ?? null,
         storageError: this.storageError,
+        evolution: null,
       });
       this.callbacks.onStatus?.("complete");
       return summary;
@@ -317,6 +350,7 @@ export class OptimizerCoordinator {
       if (!this.cancelled) {
         this.callbacks.onStatus?.("failed");
         if (this.checkpoint) {
+          await this.flushPendingPersist();
           await this.persist({ ...this.checkpoint, status: "failed" });
         }
       }
@@ -325,6 +359,86 @@ export class OptimizerCoordinator {
       this.workers.forEach((worker) => worker.terminate());
       this.workers = [];
     }
+  }
+
+  /**
+   * Refuse anything that would not continue exactly. `assessOptimizerCheckpoint`
+   * explains these to the user before a resume is offered; this is the last line.
+   */
+  private assertResumable(checkpoint: OptimizerCheckpoint): void {
+    if (checkpoint.schemaVersion !== OPTIMIZER_CHECKPOINT_SCHEMA_VERSION) {
+      throw new Error("Checkpoint schema is not supported by this build");
+    }
+    if (checkpoint.engineVersion !== OPTIMIZER_ENGINE_VERSION) {
+      throw new Error("Checkpoint was produced by a different optimizer engine");
+    }
+    if (
+      checkpoint.inputFingerprint !== this.inputFingerprint ||
+      checkpoint.jobId !== this.jobId
+    ) {
+      throw new Error("Checkpoint does not match this optimizer job");
+    }
+    if (checkpoint.algorithm !== this.algorithm) {
+      throw new Error("Checkpoint used a different search algorithm");
+    }
+    if (
+      checkpoint.explorationSeedBankFingerprint !== this.seedBanks.exploration ||
+      checkpoint.confirmationSeedBankFingerprint !== this.seedBanks.confirmation
+    ) {
+      throw new Error("Checkpoint seed banks do not match this job");
+    }
+    if (
+      checkpoint.algorithm === "evolutionary" &&
+      checkpoint.stage === "exploration" &&
+      !checkpoint.evolution
+    ) {
+      throw new Error("Checkpoint lacks evolutionary generation state");
+    }
+  }
+
+  private resolvePopulation(
+    checkpoint: OptimizerCheckpoint
+  ): OptimizerCandidate[] {
+    const byFingerprint = new Map(
+      checkpoint.candidates.map((candidate) => [
+        candidate.fingerprint,
+        candidate,
+      ])
+    );
+    return (checkpoint.evolution?.population ?? []).map((fingerprint) => {
+      const candidate = byFingerprint.get(fingerprint);
+      if (!candidate) {
+        throw new Error("Checkpoint generation references an unknown candidate");
+      }
+      return candidate;
+    });
+  }
+
+  private buildCheckpoint(fields: {
+    stage: OptimizerStage;
+    status: OptimizerCheckpointStatus;
+    candidates: readonly OptimizerCandidate[];
+    exploration: readonly OptimizerEvaluation[];
+    confirmation: readonly OptimizerEvaluation[];
+  }): OptimizerCheckpoint {
+    return {
+      schemaVersion: OPTIMIZER_CHECKPOINT_SCHEMA_VERSION,
+      engineVersion: OPTIMIZER_ENGINE_VERSION,
+      jobId: this.jobId,
+      inputFingerprint: this.inputFingerprint,
+      input: this.input,
+      algorithm: this.algorithm,
+      stage: fields.stage,
+      status: fields.status,
+      candidates: fields.candidates,
+      exploration: fields.exploration,
+      confirmation: fields.confirmation,
+      evolution: fields.stage === "exploration" ? this.evolution : null,
+      explorationSeedBankFingerprint: this.seedBanks.exploration,
+      confirmationSeedBankFingerprint: this.seedBanks.confirmation,
+      activeComputeMs: this.currentActiveComputeMs(),
+      updatedAt: Date.now(),
+    };
   }
 
   private createWorkers(): void {
@@ -342,7 +456,6 @@ export class OptimizerCoordinator {
     seeds: readonly number[],
     stage: OptimizerEvaluation["stage"],
     existing: readonly OptimizerEvaluation[],
-    algorithm: "grid" | "evolutionary",
     allCandidates: readonly OptimizerCandidate[],
     otherStageResults: readonly OptimizerEvaluation[]
   ): Promise<OptimizerEvaluation[]> {
@@ -352,10 +465,16 @@ export class OptimizerCoordinator {
         evaluation,
       ])
     );
+    // Only this stage's pending work is dispatched; anything already committed
+    // (from this run or a resumed checkpoint) is merged exactly once.
     const pending = candidates.filter(
       (candidate) => !byFingerprint.has(candidate.fingerprint)
     );
-    const stageTotal = byFingerprint.size + pending.length;
+    const stageCandidates = new Set([
+      ...candidates.map((candidate) => candidate.fingerprint),
+    ]);
+    const stageTotal =
+      stage === "exploration" ? byFingerprint.size + pending.length : stageCandidates.size;
     const batches: OptimizerCandidate[][] = [];
     for (let index = 0; index < pending.length; index += CANDIDATES_PER_BATCH) {
       batches.push(pending.slice(index, index + CANDIDATES_PER_BATCH));
@@ -363,6 +482,45 @@ export class OptimizerCoordinator {
     let nextBatch = 0;
     const invocation = this.stageSequence;
     this.stageSequence += 1;
+
+    const commit = (evaluations: readonly OptimizerEvaluation[]) => {
+      evaluations.forEach((evaluation) =>
+        byFingerprint.set(evaluation.candidate.fingerprint, evaluation)
+      );
+      const combined = [...byFingerprint.values()];
+      const exploration =
+        stage === "exploration" ? combined : [...otherStageResults];
+      const confirmation =
+        stage === "confirmation" ? combined : [...otherStageResults];
+      this.checkpoint = this.buildCheckpoint({
+        stage,
+        status: this.paused ? "paused" : "running",
+        candidates: allCandidates,
+        exploration,
+        confirmation,
+      });
+      this.persistThrottled(this.checkpoint);
+      const ranked = rankOptimizerEvaluations(combined);
+      this.callbacks.onProgress?.({
+        stage,
+        evaluated:
+          stage === "exploration"
+            ? combined.length
+            : combined.filter((evaluation) =>
+                stageCandidates.has(evaluation.candidate.fingerprint)
+              ).length,
+        total: stageTotal,
+        activeComputeMs: this.currentActiveComputeMs(),
+        best: ranked[0] ?? null,
+        storageError: this.storageError,
+        evolution: stage === "exploration" ? this.evolution : null,
+      });
+    };
+
+    if (batches.length === 0) {
+      // Nothing new to dispatch (fully resumed stage); still surface progress.
+      commit([]);
+    }
 
     const runner = async (worker: Worker) => {
       while (!this.cancelled) {
@@ -382,37 +540,8 @@ export class OptimizerCoordinator {
           stage,
           batchId
         );
-        evaluations.forEach((evaluation) =>
-          byFingerprint.set(evaluation.candidate.fingerprint, evaluation)
-        );
-        const combined = [...byFingerprint.values()];
-        const exploration =
-          stage === "exploration" ? combined : [...otherStageResults];
-        const confirmation =
-          stage === "confirmation" ? combined : [...otherStageResults];
-        this.checkpoint = {
-          jobId: this.jobId,
-          inputFingerprint: this.inputFingerprint,
-          input: this.input,
-          algorithm,
-          stage,
-          status: this.paused ? "paused" : "running",
-          candidates: allCandidates,
-          exploration,
-          confirmation,
-          activeComputeMs: this.currentActiveComputeMs(),
-          updatedAt: Date.now(),
-        };
-        this.persistThrottled(this.checkpoint);
-        const ranked = rankOptimizerEvaluations(combined);
-        this.callbacks.onProgress?.({
-          stage,
-          evaluated: combined.length,
-          total: stageTotal,
-          activeComputeMs: this.currentActiveComputeMs(),
-          best: ranked[0] ?? null,
-          storageError: this.storageError,
-        });
+        if (this.cancelled) return;
+        commit(evaluations);
       }
     };
 
@@ -430,23 +559,29 @@ export class OptimizerCoordinator {
     batchId: string
   ): Promise<readonly OptimizerEvaluation[]> {
     return new Promise((resolve, reject) => {
-      const rejectPending = (error: Error) => {
+      let settled = false;
+      const cleanup = () => {
+        settled = true;
         worker.removeEventListener("message", onMessage);
         worker.removeEventListener("error", onError);
         this.pendingBatchRejectors.delete(rejectPending);
+      };
+      const rejectPending = (error: Error) => {
+        if (settled) return;
+        cleanup();
         reject(error);
       };
       const onMessage = (event: MessageEvent<OptimizerWorkerResponse>) => {
         const response = event.data;
+        // Duplicate, obsolete, or foreign messages never reach the merge.
         if (
+          settled ||
           response.jobId !== this.jobId ||
           response.batchId !== batchId
         ) {
           return;
         }
-        worker.removeEventListener("message", onMessage);
-        worker.removeEventListener("error", onError);
-        this.pendingBatchRejectors.delete(rejectPending);
+        cleanup();
         if (
           response.engineVersion !== OPTIMIZER_ENGINE_VERSION ||
           response.inputFingerprint !== this.inputFingerprint
@@ -454,6 +589,14 @@ export class OptimizerCoordinator {
           reject(new Error("Rejected stale optimizer batch"));
         } else if (response.type === "error") {
           reject(new Error(response.message));
+        } else if (
+          response.evaluations.length !== candidates.length ||
+          response.evaluations.some(
+            (evaluation, index) =>
+              evaluation.candidate.fingerprint !== candidates[index].fingerprint
+          )
+        ) {
+          reject(new Error("Optimizer batch returned unexpected candidates"));
         } else {
           resolve(response.evaluations);
         }
@@ -538,12 +681,30 @@ export class OptimizerCoordinator {
   }
 
   private async persist(checkpoint: OptimizerCheckpoint): Promise<void> {
+    this.reportPersistence({ ...this.persistence, status: "saving" });
     try {
       await saveOptimizerCheckpoint(checkpoint);
       this.storageError = null;
+      this.reportPersistence({
+        status: "saved",
+        updatedAt: checkpoint.updatedAt,
+        error: null,
+        savedEvaluations:
+          checkpoint.exploration.length + checkpoint.confirmation.length,
+      });
     } catch (error) {
       this.storageError =
         error instanceof Error ? error.message : "Checkpoint storage failed";
+      this.reportPersistence({
+        ...this.persistence,
+        status: "failed",
+        error: this.storageError,
+      });
     }
+  }
+
+  private reportPersistence(state: OptimizerPersistenceState): void {
+    this.persistence = state;
+    this.callbacks.onPersistence?.(state);
   }
 }

@@ -8,12 +8,9 @@ This document is the implementation handoff for:
 
 ## Current state
 
-- Branch: `feat/codex-4`
-- Base commit when work began: `cb65495`
-- Status: implemented and passing automated validation
-- Worktree: intentionally uncommitted and dirty
-
-Do not reset or broadly overwrite the worktree. It also contains pre-existing/concurrent Vault and Decision Ghost changes that were preserved and integrated. Stage and review files selectively before committing.
+- Features 7–9, Vault, and Decision Ghosts are committed (`f2fe5cb`). The `feat/codex-4` dirty-worktree notes below are historical.
+- 2026-09-04 P0 follow-up (branch `ci/cd`, uncommitted): effective Setup preview, versioned optimizer checkpoints with exact resume, and real-browser QA. See "P0 follow-up (2026-09-04)" at the end of this document before the historical sections.
+- Unrelated dirty files at the repo root (`HANDOFF.md`, `HANDOFF_BACCARAT.md`, `scripts/baccarat_exact.py`) belong to separate baccarat work; leave them alone.
 
 ## Validation completed
 
@@ -147,7 +144,7 @@ Primary ranking order:
 - IndexedDB database: `velvet-stakes-optimizer`
 - Checkpoints store inputs, candidates, and aggregates, not raw simulation traces.
 
-Known limitation: an interrupted evolutionary job resumes from completed candidate state, but the checkpoint does not record an explicit generation counter. A resume can proceed toward confirmation without replaying every originally intended future generation. Fix this before promising exact mid-generation continuation.
+Resolved 2026-09-04: checkpoint schema 2 records the engine version, the evolutionary generation and population, and the seed-bank fingerprints, so an interrupted job continues exactly (see the P0 follow-up section). Schema 1 evolutionary checkpoints interrupted during exploration are reported as incompatible and offered a fresh start instead.
 
 ### Custom presets
 
@@ -156,7 +153,7 @@ Known limitation: an interrupted evolutionary job resumes from completed candida
 - Built-in presets cannot be overwritten.
 - Setup clones a saved preset into the new session; the optimizer never mutates an active session.
 
-Known UI limitation: the starting-ladder preview in Setup still derives from `DEFAULT_LADDERS` even when a custom preset is selected. The session engine receives and clamps the custom strategy correctly, but the preview should be updated to display the selected custom ladders.
+Resolved 2026-09-04: Setup and session creation both go through `resolveSessionPlan` (`src/engine/session-plan.ts`), so the preview shows the selected preset's own ladders and an "Effective Session Plan" card lists exactly what gets frozen.
 
 ## Phase 3: True multi-game support
 
@@ -253,7 +250,7 @@ Before merging, test in a real browser:
 3. Fix any visual or worker-lifecycle defects found.
 4. Add a real-browser worker integration test if the project test stack permits it.
 5. Decide whether exact optimizer generation resume and full minor-unit storage are merge blockers or documented follow-ups.
-6. Update the Setup custom-preset ladder preview.
+6. ~~Update the Setup custom-preset ladder preview.~~ Done 2026-09-04.
 
 ## Guardrails for future changes
 
@@ -264,3 +261,55 @@ Before merging, test in a real browser:
 - Do not recompute a historical variance fan silently.
 - Do not merge card-counting adjustments into immutable base game odds.
 - Do not delete or reset unrelated dirty work while preparing commits.
+
+---
+
+## P0 follow-up (2026-09-04)
+
+Scope: the first milestone of the app-enhancement roadmap (trustworthy configuration and recovery). P1/P2 items were not started.
+
+### A. Effective strategy preview (Setup)
+
+Problem fixed: Setup previewed `DEFAULT_LADDERS` for every preset and built the session strategy separately from the preview, so a Lab preset user saw L1/L2/L3 while the session ran Lab ladders. Setup also had no Max Rounds or Table Max inputs, so a Lab preset could never match its confirmed objective.
+
+- `src/engine/session-plan.ts` (new): `resolveSessionPlan` is the single resolution used by both the preview and `startSession`. It returns the exact `config`/`strategy`/`game` frozen into the session, the engine's starting-ladder clamp as an explicit adjustment (and writes the clamped value into the frozen config), blockers (first stake above bankroll or table max), and Lab provenance status with a per-field mismatch list (game, bankroll, target, stop loss, max rounds, table max, starting ladder, candidate fingerprint). An unknown preset id is an error, never a fallback to another strategy. `configFromPresetProvenance` and `findRegisteredGameByFingerprint` power the "Use confirmed settings" action.
+- `src/app/setup/page.tsx`: Starting Ladder cards come from the resolved plan; new Max Rounds and Table Max (0 = none) inputs; new "Effective Session Plan" card (text only, `<dl>`/`<ul>`, no colour-only meaning); Start refuses when the plan cannot resolve or has blockers. Editing Setup never touches an active session (covered by test).
+- Tests: `src/engine/session-plan.test.ts` (10), `src/app/setup/page.test.tsx` (4, router mocked), fixture `src/engine/optimizer-preset.fixture.ts`.
+
+### B. Deterministic optimizer recovery
+
+Checkpoint audit result: schema 1 lacked engine/schema version, generation and population state, and any seed-bank record; the resume path skipped remaining evolutionary generations.
+
+- `src/engine/optimizer-storage.ts`: `OPTIMIZER_CHECKPOINT_SCHEMA_VERSION = 2`. New fields: `schemaVersion`, `engineVersion`, `evolution { generation, generationCount, populationSize, population[] }`, `explorationSeedBankFingerprint`, `confirmationSeedBankFingerprint`. IndexedDB database/version unchanged (`velvet-stakes-optimizer` v1); the record shape is versioned, not the store. `assessOptimizerCheckpoint` classifies a stored record as `resumable` (schema 1 grid or post-exploration records are upgraded in memory), `incompatible` (engine/schema/fingerprint/seed-bank/algorithm mismatch, or schema 1 evolutionary exploration) with a reason and the saved inputs, or `finished`.
+- `src/engine/optimizer-coordinator.ts`: the evolutionary loop resumes at the saved generation with the saved population; committed evaluations are never re-dispatched and every batch merges at most once by candidate fingerprint; `assertResumable` re-checks versions, fingerprints, algorithm, and seed banks before running; worker replies are validated against the dispatched candidates; duplicate/late messages are dropped after settlement. New `onPersistence` callback reports `unsaved | saving | saved | failed` with the last saved time and committed-evaluation count so a failed write is never shown as saved. `settled()` awaits queued writes.
+- `src/app/optimizer/page.tsx`: resumable banner (committed evaluations, generation, saved time, status, Resume/Discard); incompatible banner (reason, Start Fresh With Saved Inputs, Discard); running view shows status + stage labels, "N / M candidates", generation, an explicit "no time estimate" note, the checkpoint line, and Back to Setup / Start Over after failure or cancel. Progress bar has ARIA values and `motion-reduce`.
+- Tests: `src/engine/optimizer-storage.test.ts` (10) and eight new cases in `src/engine/optimizer-coordinator.test.ts`: interrupted evolutionary exploration, interrupted confirmation (1 worker vs 2-worker baseline, so also scheduling independence), interrupted grid, duplicate deliveries, late results after cancel, refused engine/schema/seed/job mismatches, failed storage reporting, saved-count reporting. Determinism contract: same inputs, seed, budget, and engine version give identical confirmed frontiers whether or not the run was interrupted.
+
+### C. Browser verification
+
+`scripts/qa/browser-qa.mjs` drives the static export (`npm run build`, then any static server on `out/`) with Playwright. Playwright is not a project dependency; set `PLAYWRIGHT_MODULE` to an installed package directory (this machine: the global `grok-browser-cli` install). Run 2026-09-04, Chromium 149 headless, desktop Linux, all checks passed:
+
+- Real workers + IndexedDB: evolutionary job (384-candidate space) paused mid-generation, page reloaded, resumed from the banner; the confirmed frontier matched the uninterrupted run exactly. Same result for a hard reload mid-run at 72 committed evaluations. Cancel of a 2-worker job showed "Cancelled" in 66 ms with no later progress mutation, and a cancelled job is not offered for resume. A schema-1 evolutionary record injected into IndexedDB produced the incompatible banner, not a resume.
+- Setup: saved Lab preset previewed Lab 1–3 (no L1), mismatch list matched the confirmed objective, "Use confirmed settings" flipped it to "Confirmed for these settings", and the started session's persisted strategy/config equalled the preview.
+- Forecast benchmark (default even-money session, 5,000 rounds): preview status at 13 ms, full 2,500-sample forecast ready at 823 ms, main-thread rAF latency ≈13 ms while modelling, ≈10 MB page heap. Desktop numbers only; no phone was measured.
+- iPhone SE viewport with reduced motion: no horizontal overflow on Setup. Screenshots are written to `/tmp/velvet-qa` (ephemeral).
+
+Not verified: Capacitor shell and worker backgrounding on a real phone, Baccarat/craps session flows through the browser (unit-covered only), real midrange-phone timings. The Maestro flows in `.maestro/` were not run.
+
+### Observations for follow-up (not fixed)
+
+- The Lab can confirm degenerate ladders (e.g. a third ladder of seven identical table-max rungs). Consider a candidate filter for flat capped ladders before P1 strategy comparison work.
+- Setup still uses the slate palette while other routes use the noir tokens; left as-is to preserve the page's existing identity.
+
+### Validation (2026-09-04, from `betting-companion/`)
+
+- `npx vitest run`: 28 files, 365 tests passed (baseline before this work: 25 files, 333 tests)
+- `npx tsc --noEmit`: passed
+- `npm run lint -- --quiet`: passed
+- `npm run build`: passed (static export)
+- `git diff --check`: passed
+- `node scripts/qa/browser-qa.mjs`: all browser checks passed
+
+### Next bounded task
+
+P1 strategy comparison with a flat-stake baseline, reusing `resolveSessionPlan` for the shared comparison configuration and the optimizer worker protocol for evaluation. Before that, decide whether to filter flat capped ladders out of Lab candidates.

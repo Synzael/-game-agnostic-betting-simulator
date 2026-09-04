@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Button, Card, NumberInput } from "@/components/ui";
 import {
@@ -18,16 +18,69 @@ import {
 import {
   OptimizerCoordinator,
   type OptimizerCoordinatorCallbacks,
+  type OptimizerPersistenceState,
   type OptimizerProgress,
   type OptimizerRunSummary,
 } from "@/engine/optimizer-coordinator";
 import {
+  assessOptimizerCheckpoint,
+  deleteOptimizerCheckpoint,
   loadLatestOptimizerCheckpoint,
   type OptimizerCheckpoint,
+  type OptimizerCheckpointAssessment,
 } from "@/engine/optimizer-storage";
 import { useCustomPresetStore } from "@/store";
 
 type View = "configure" | "review" | "running" | "results";
+type JobStatus =
+  | "idle"
+  | "running"
+  | "paused"
+  | "cancelled"
+  | "complete"
+  | "failed";
+
+/** A saved job worth telling the user about (finished jobs are not). */
+type SavedJobNotice = Exclude<
+  OptimizerCheckpointAssessment,
+  { kind: "finished" }
+>;
+
+const STAGE_LABELS: Record<OptimizerProgress["stage"], string> = {
+  exploration: "Exploring candidates",
+  confirmation: "Confirming finalists on holdout seeds",
+  complete: "Complete",
+};
+
+const STATUS_LABELS: Record<JobStatus, string> = {
+  idle: "Waiting",
+  running: "Computing",
+  paused: "Paused",
+  cancelled: "Cancelled",
+  complete: "Complete",
+  failed: "Failed",
+};
+
+function formatTime(timestamp: number | null): string {
+  if (timestamp === null) return "never";
+  return new Date(timestamp).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function describeSavedJob(checkpoint: OptimizerCheckpoint): string {
+  const committed =
+    checkpoint.exploration.length + checkpoint.confirmation.length;
+  const stage =
+    checkpoint.stage === "exploration"
+      ? checkpoint.evolution
+        ? `exploration, generation ${checkpoint.evolution.generation + 1} of ${checkpoint.evolution.generationCount}`
+        : "exploration"
+      : checkpoint.stage;
+  return `${committed} committed evaluation${committed === 1 ? "" : "s"} · ${stage} · saved ${formatTime(checkpoint.updatedAt)} · status ${checkpoint.status}`;
+}
 
 export default function OptimizerPage() {
   const games = getAllGames();
@@ -42,12 +95,12 @@ export default function OptimizerPage() {
   const [view, setView] = useState<View>("configure");
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<OptimizerProgress | null>(null);
+  const [persistence, setPersistence] =
+    useState<OptimizerPersistenceState | null>(null);
   const [summary, setSummary] = useState<OptimizerRunSummary | null>(null);
-  const [jobStatus, setJobStatus] = useState<
-    "idle" | "running" | "paused" | "cancelled" | "complete" | "failed"
-  >("idle");
-  const [checkpoint, setCheckpoint] =
-    useState<OptimizerCheckpoint | null>(null);
+  const [jobStatus, setJobStatus] = useState<JobStatus>("idle");
+  const [savedJob, setSavedJob] = useState<SavedJobNotice | null>(null);
+  const [savedJobError, setSavedJobError] = useState<string | null>(null);
   const [activeInput, setActiveInput] = useState<OptimizerJobInput | null>(
     null
   );
@@ -113,21 +166,37 @@ export default function OptimizerPage() {
     };
   const cardinality = estimateSearchCardinality(input.searchSpace);
 
-  useEffect(() => {
-    void loadLatestOptimizerCheckpoint()
-      .then((latest) => {
-        if (
-          latest &&
-          latest.status !== "complete" &&
-          latest.status !== "cancelled"
-        ) {
-          setCheckpoint(latest);
+  // State updates happen inside promise callbacks, never synchronously in
+  // the effect body, so mount-time refresh does not cascade renders.
+  const refreshSavedJob = useCallback(
+    () =>
+      loadLatestOptimizerCheckpoint().then(
+        (latest) => {
+          setSavedJobError(null);
+          if (!latest) {
+            setSavedJob(null);
+            return;
+          }
+          const assessment = assessOptimizerCheckpoint(latest);
+          setSavedJob(assessment.kind === "finished" ? null : assessment);
+        },
+        (loadError: unknown) => {
+          // IndexedDB is optional for starting a fresh in-memory job, but the
+          // user should know saved work could not be read.
+          setSavedJob(null);
+          setSavedJobError(
+            loadError instanceof Error
+              ? `Saved jobs could not be read: ${loadError.message}`
+              : "Saved jobs could not be read on this device."
+          );
         }
-      })
-      .catch(() => {
-        // IndexedDB is optional for starting a fresh in-memory job.
-      });
-  }, []);
+      ),
+    []
+  );
+
+  useEffect(() => {
+    void refreshSavedJob();
+  }, [refreshSavedJob]);
 
   useEffect(
     () => () => {
@@ -141,6 +210,7 @@ export default function OptimizerPage() {
   const callbacks: OptimizerCoordinatorCallbacks = {
     onProgress: setProgress,
     onStatus: (status) => setJobStatus(status),
+    onPersistence: setPersistence,
   };
 
   const review = () => {
@@ -163,32 +233,74 @@ export default function OptimizerPage() {
   ) => {
     setError(null);
     setSummary(null);
+    setProgress(null);
+    setPersistence(null);
     setActiveInput(runInput);
     setView("running");
     setJobStatus("running");
-    const coordinator = new OptimizerCoordinator(
-      runInput,
-      callbacks,
-      resumeFrom?.jobId
-    );
+    let coordinator: OptimizerCoordinator;
+    try {
+      coordinator = new OptimizerCoordinator(
+        runInput,
+        callbacks,
+        resumeFrom?.jobId
+      );
+    } catch (constructError) {
+      setError(
+        constructError instanceof Error
+          ? constructError.message
+          : "Optimizer input is invalid"
+      );
+      setJobStatus("failed");
+      return;
+    }
     coordinatorRef.current = coordinator;
     try {
       const completed = await coordinator.run(resumeFrom);
       setSummary(completed);
-      setCheckpoint(null);
+      setSavedJob(null);
       setView("results");
     } catch (runError) {
       if (coordinatorRef.current === coordinator) {
         const message =
           runError instanceof Error ? runError.message : "Optimizer failed";
         setError(message);
-        if (/cancelled/i.test(message)) {
-          setJobStatus("cancelled");
-        } else {
-          setJobStatus("failed");
-        }
+        setJobStatus(/cancelled/i.test(message) ? "cancelled" : "failed");
+        await coordinator.settled();
+        void refreshSavedJob();
       }
     }
+  };
+
+  const discardSavedJob = async (jobId: string) => {
+    try {
+      await deleteOptimizerCheckpoint(jobId);
+      setSavedJob(null);
+      setSavedJobError(null);
+    } catch (deleteError) {
+      setSavedJobError(
+        deleteError instanceof Error
+          ? `Saved job could not be removed: ${deleteError.message}`
+          : "Saved job could not be removed."
+      );
+    }
+  };
+
+  const restartFromInputs = (savedInput: OptimizerJobInput, jobId: string) => {
+    try {
+      validateOptimizerInput(savedInput);
+    } catch (validationError) {
+      setSavedJobError(
+        validationError instanceof Error
+          ? `The saved inputs no longer validate: ${validationError.message}`
+          : "The saved inputs no longer validate."
+      );
+      return;
+    }
+    void deleteOptimizerCheckpoint(jobId).catch(() => {
+      // The stale record is superseded by the new job's checkpoint anyway.
+    });
+    void run(savedInput);
   };
 
   const saveResult = (result: OptimizerResult) => {
@@ -203,6 +315,29 @@ export default function OptimizerPage() {
       );
     }
   };
+
+  const persistenceLine = (() => {
+    if (!persistence) return "Checkpoint: not saved yet.";
+    switch (persistence.status) {
+      case "saved":
+        return `Checkpoint saved ${formatTime(persistence.updatedAt)} · ${persistence.savedEvaluations} committed evaluations. Closing this page keeps the job resumable.`;
+      case "saving":
+        return persistence.updatedAt
+          ? `Saving checkpoint… last saved ${formatTime(persistence.updatedAt)}.`
+          : "Saving first checkpoint…";
+      case "failed":
+        return `Checkpoint not saved: ${persistence.error ?? "storage failed"}. ${
+          persistence.updatedAt
+            ? `Progress after ${formatTime(persistence.updatedAt)} would be lost if this page closes.`
+            : "This job is not saved; closing this page loses it."
+        }`;
+      case "unsaved":
+        return "Checkpoint: not saved yet.";
+    }
+  })();
+
+  const jobFinished =
+    jobStatus === "failed" || jobStatus === "cancelled";
 
   return (
     <div className="min-h-screen bg-noir p-4 safe-bottom">
@@ -224,22 +359,77 @@ export default function OptimizerPage() {
       </header>
 
       <main className="mx-auto max-w-2xl space-y-4">
-        {checkpoint && view === "configure" && (
-          <Card variant="warning">
+        {savedJobError && view === "configure" && (
+          <p role="status" className="text-xs text-amber-300">
+            {savedJobError}
+          </p>
+        )}
+
+        {savedJob?.kind === "resumable" && view === "configure" && (
+          <Card variant="warning" data-testid="saved-job-resumable">
             <h2 className="font-display text-lg text-amber-200">
               Interrupted job found
             </h2>
             <p className="mt-1 text-sm text-secondary">
-              Resume from its last complete batch. No raw path traces are
-              stored.
+              {describeSavedJob(savedJob.checkpoint)}
             </p>
-            <Button
-              className="mt-4"
-              size="sm"
-              onClick={() => void run(checkpoint.input, checkpoint)}
-            >
-              Resume Saved Job
-            </Button>
+            <p className="mt-2 text-xs text-muted">
+              Resuming continues exactly from the last committed batch with the
+              same seeds and search state; the confirmed result matches an
+              uninterrupted run. No raw path traces are stored.
+              {savedJob.upgraded &&
+                " This job was saved by an earlier app version; its stored state is sufficient to continue exactly."}
+            </p>
+            <div className="mt-4 grid grid-cols-2 gap-3">
+              <Button
+                size="sm"
+                onClick={() =>
+                  void run(savedJob.checkpoint.input, savedJob.checkpoint)
+                }
+              >
+                Resume Saved Job
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => void discardSavedJob(savedJob.checkpoint.jobId)}
+              >
+                Discard
+              </Button>
+            </div>
+          </Card>
+        )}
+
+        {savedJob?.kind === "incompatible" && view === "configure" && (
+          <Card variant="danger" data-testid="saved-job-incompatible">
+            <h2 className="font-display text-lg text-red-200">
+              Saved job cannot be resumed exactly
+            </h2>
+            <p className="mt-1 text-sm text-secondary">{savedJob.reason}</p>
+            <p className="mt-2 text-xs text-muted">
+              Saved {formatTime(savedJob.updatedAt)}. Its committed results are
+              not carried forward; a fresh run starts from zero with the same
+              inputs.
+            </p>
+            <div className="mt-4 grid grid-cols-2 gap-3">
+              {savedJob.input && (
+                <Button
+                  size="sm"
+                  onClick={() =>
+                    restartFromInputs(savedJob.input!, savedJob.jobId)
+                  }
+                >
+                  Start Fresh With Saved Inputs
+                </Button>
+              )}
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => void discardSavedJob(savedJob.jobId)}
+              >
+                Discard
+              </Button>
+            </div>
           </Card>
         )}
 
@@ -466,28 +656,51 @@ export default function OptimizerPage() {
           <Section title="4 · Computing locally">
             <div className="mb-4 flex items-end justify-between">
               <div>
-                <div className="text-xs uppercase tracking-wider text-muted">
-                  {progress?.stage ?? "starting"}
+                <div
+                  className="text-xs uppercase tracking-wider text-muted"
+                  data-testid="job-status"
+                >
+                  {STATUS_LABELS[jobStatus]}
+                  {progress ? ` · ${STAGE_LABELS[progress.stage]}` : ""}
                 </div>
-                <div className="font-display text-3xl text-gold">
-                  {progress?.evaluated ?? 0} / {progress?.total ?? cardinality}
+                <div
+                  className="font-display text-3xl text-gold"
+                  aria-live="polite"
+                  data-testid="job-progress"
+                >
+                  {progress?.evaluated ?? 0} / {progress?.total ?? "…"}{" "}
+                  <span className="text-base text-secondary">candidates</span>
                 </div>
+                {progress?.evolution && (
+                  <div className="text-xs text-muted">
+                    Generation {progress.evolution.generation + 1} of{" "}
+                    {progress.evolution.generationCount} ·{" "}
+                    {progress.evolution.population.length} in this generation
+                  </div>
+                )}
               </div>
               <div className="text-right text-xs text-secondary">
                 {((progress?.activeComputeMs ?? 0) / 1000).toFixed(1)}s active
                 compute
+                <div className="text-muted">No time estimate is shown; only measured work.</div>
               </div>
             </div>
-            <div className="h-2 overflow-hidden rounded-full bg-slate-800">
+            <div
+              className="h-2 overflow-hidden rounded-full bg-slate-800"
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={progress?.total ?? 0}
+              aria-valuenow={progress?.evaluated ?? 0}
+              aria-label={`${progress?.evaluated ?? 0} of ${progress?.total ?? 0} candidates evaluated in the current stage`}
+            >
               <div
-                className="h-full bg-[var(--gold)] transition-[width]"
+                className="h-full bg-[var(--gold)] transition-[width] motion-reduce:transition-none"
                 style={{
-                  width: `${Math.min(
-                    100,
-                    ((progress?.evaluated ?? 0) /
-                      Math.max(1, progress?.total ?? cardinality)) *
-                      100
-                  )}%`,
+                  width: `${
+                    progress && progress.total > 0
+                      ? Math.min(100, (progress.evaluated / progress.total) * 100)
+                      : 0
+                  }%`,
                 }}
               />
             </div>
@@ -499,28 +712,52 @@ export default function OptimizerPage() {
                 bound {(progress.best.ruin.upper * 100).toFixed(1)}%.
               </div>
             )}
-            {progress?.storageError && (
-              <p className="mt-3 text-xs text-amber-300">
-                Checkpoint unavailable: {progress.storageError}
-              </p>
+            <p
+              className={`mt-3 text-xs ${
+                persistence?.status === "failed" ? "text-amber-300" : "text-muted"
+              }`}
+              role={persistence?.status === "failed" ? "alert" : undefined}
+              data-testid="checkpoint-state"
+            >
+              {persistenceLine}
+            </p>
+            {jobFinished ? (
+              <div className="mt-5 grid grid-cols-2 gap-3">
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    setView("configure");
+                    setError(null);
+                    void refreshSavedJob();
+                  }}
+                >
+                  Back to Setup
+                </Button>
+                {jobStatus === "failed" && activeInput && (
+                  <Button onClick={() => void run(activeInput)}>
+                    Start Over
+                  </Button>
+                )}
+              </div>
+            ) : (
+              <div className="mt-5 grid grid-cols-2 gap-3">
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    if (jobStatus === "paused") coordinatorRef.current?.resume();
+                    else coordinatorRef.current?.pause();
+                  }}
+                >
+                  {jobStatus === "paused" ? "Resume" : "Pause"}
+                </Button>
+                <Button
+                  variant="danger"
+                  onClick={() => coordinatorRef.current?.cancel()}
+                >
+                  Cancel
+                </Button>
+              </div>
             )}
-            <div className="mt-5 grid grid-cols-2 gap-3">
-              <Button
-                variant="secondary"
-                onClick={() => {
-                  if (jobStatus === "paused") coordinatorRef.current?.resume();
-                  else coordinatorRef.current?.pause();
-                }}
-              >
-                {jobStatus === "paused" ? "Resume" : "Pause"}
-              </Button>
-              <Button
-                variant="danger"
-                onClick={() => coordinatorRef.current?.cancel()}
-              >
-                Cancel
-              </Button>
-            </div>
           </Section>
         )}
 
@@ -623,6 +860,7 @@ export default function OptimizerPage() {
                 onClick={() => {
                   setView("configure");
                   setSummary(null);
+                  void refreshSavedJob();
                 }}
               >
                 New Search

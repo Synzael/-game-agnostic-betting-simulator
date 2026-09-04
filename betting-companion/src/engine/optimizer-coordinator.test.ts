@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { OptimizerCoordinator } from "./optimizer-coordinator";
+import {
+  OptimizerCoordinator,
+  type OptimizerPersistenceState,
+  type OptimizerProgress,
+} from "./optimizer-coordinator";
+import {
+  assessOptimizerCheckpoint,
+  type OptimizerCheckpoint,
+} from "./optimizer-storage";
 import {
   OPTIMIZER_ENGINE_VERSION,
   OPTIMIZER_GRID_THRESHOLD,
@@ -8,18 +16,29 @@ import {
   type OptimizerEvaluation,
   type OptimizerJobInput,
 } from "./optimizer";
-import { createDefaultGameSnapshot } from "./games";
+import { createDefaultGameSnapshot, fingerprintValue } from "./games";
 import type { FrozenGameSnapshot } from "./types";
 import type {
   OptimizerWorkerRequest,
   OptimizerWorkerResponse,
 } from "@/workers/optimizer.protocol";
 
-vi.mock("./optimizer-storage", () => ({
-  saveOptimizerCheckpoint: vi.fn(async () => {}),
-  loadLatestOptimizerCheckpoint: vi.fn(async () => undefined),
-  deleteOptimizerCheckpoint: vi.fn(async () => {}),
-}));
+/** Every persisted checkpoint, in write order; the last one is what a reload would see. */
+const savedCheckpoints: OptimizerCheckpoint[] = [];
+let failPersistence: Error | null = null;
+
+vi.mock("./optimizer-storage", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./optimizer-storage")>();
+  return {
+    ...actual,
+    saveOptimizerCheckpoint: vi.fn(async (checkpoint: OptimizerCheckpoint) => {
+      if (failPersistence) throw failPersistence;
+      savedCheckpoints.push(structuredClone(checkpoint));
+    }),
+    loadLatestOptimizerCheckpoint: vi.fn(async () => undefined),
+    deleteOptimizerCheckpoint: vi.fn(async () => {}),
+  };
+});
 
 function binaryGame(pWin: number): FrozenGameSnapshot {
   const base = createDefaultGameSnapshot();
@@ -43,10 +62,14 @@ let onDispatch: ((request: OptimizerWorkerRequest) => void) | null = null;
 function fakeEvaluation(
   candidate: OptimizerCandidate,
   stage: OptimizerEvaluation["stage"],
-  index: number
+  index: number,
+  seeds: readonly number[]
 ): OptimizerEvaluation {
-  // Deterministic, fingerprint-derived scores so ranking is stable.
-  const score = (candidate.fingerprint.charCodeAt(0) % 50) / 100 + index * 1e-6;
+  // Deterministic, fingerprint-derived scores so ranking is stable and does
+  // not depend on how candidates were batched.
+  void index;
+  const score =
+    (parseInt(candidate.fingerprint.slice(-8), 16) % 1_000) / 1_000;
   return {
     candidate,
     sampleCount: 20,
@@ -56,10 +79,19 @@ function fakeEvaluation(
     medianMaxStake: 10,
     medianMaxDrawdown: 5,
     feasible: true,
-    seedBankFingerprint: "seed-bank",
+    // Real workers fingerprint the seed bank they used; resume checks it.
+    seedBankFingerprint: fingerprintValue(seeds),
     stage,
   };
 }
+
+/** Test knobs for the fake worker: duplicate deliveries and post-terminate leaks. */
+const workerBehavior = {
+  duplicateResponses: false,
+  /** Deliver even after terminate(), like a message already queued in the event loop. */
+  leakAfterTerminate: false,
+  responseDelayMs: 0,
+};
 
 class FakeWorker {
   private listeners = new Map<string, Set<(event: unknown) => void>>();
@@ -82,8 +114,8 @@ class FakeWorker {
     dispatched.push(request);
     onDispatch?.(request);
     // Reply asynchronously, like a real worker.
-    void Promise.resolve().then(() => {
-      if (this.terminated) return;
+    const deliver = () => {
+      if (this.terminated && !workerBehavior.leakAfterTerminate) return;
       const response: OptimizerWorkerResponse = {
         type: "result",
         jobId: request.jobId,
@@ -91,13 +123,21 @@ class FakeWorker {
         engineVersion: OPTIMIZER_ENGINE_VERSION,
         inputFingerprint: request.inputFingerprint,
         evaluations: request.candidates.map((candidate, index) =>
-          fakeEvaluation(candidate, request.stage, index)
+          fakeEvaluation(candidate, request.stage, index, request.seeds)
         ),
       };
-      this.listeners
-        .get("message")
-        ?.forEach((listener) => listener({ data: response }));
-    });
+      const emit = () =>
+        this.listeners
+          .get("message")
+          ?.forEach((listener) => listener({ data: response }));
+      emit();
+      if (workerBehavior.duplicateResponses) emit();
+    };
+    if (workerBehavior.responseDelayMs > 0) {
+      setTimeout(deliver, workerBehavior.responseDelayMs);
+    } else {
+      void Promise.resolve().then(deliver);
+    }
   }
 }
 
@@ -138,7 +178,12 @@ function baseInput(overrides: Partial<OptimizerJobInput> = {}): OptimizerJobInpu
 describe("optimizer coordinator", () => {
   beforeEach(() => {
     dispatched.length = 0;
+    savedCheckpoints.length = 0;
+    failPersistence = null;
     onDispatch = null;
+    workerBehavior.duplicateResponses = false;
+    workerBehavior.leakAfterTerminate = false;
+    workerBehavior.responseDelayMs = 0;
     vi.stubGlobal("Worker", FakeWorker);
   });
 
@@ -231,5 +276,229 @@ describe("optimizer coordinator", () => {
     };
     const summary = await coordinator.run();
     expect(summary.confirmation.length).toBeGreaterThan(0);
+  });
+
+  const evolutionaryInput = () =>
+    baseInput({
+      searchSpace: {
+        ...baseInput().searchSpace,
+        ladderCount: { min: 1, max: 4 },
+        stepsPerLadder: { min: 2, max: 8 },
+        allowedStakeIncrements: [5, 10, 15, 20],
+        recoveryTargetPctValues: [0.1, 0.25, 0.5, 0.75],
+        crossoverOffsets: [0, 1, 2],
+      },
+      concurrency: 2,
+    });
+
+  /** Stable projection of a summary for equality across runs. */
+  const frontier = (summary: {
+    exploration: readonly OptimizerEvaluation[];
+    confirmation: readonly OptimizerEvaluation[];
+  }) => ({
+    explored: [...summary.exploration]
+      .map((evaluation) => evaluation.candidate.fingerprint)
+      .sort(),
+    confirmed: summary.confirmation.map((evaluation) => [
+      evaluation.candidate.fingerprint,
+      evaluation.target.lower,
+      evaluation.ruin.upper,
+    ]),
+  });
+
+  /**
+   * Run until the Nth dispatch of `stage`, detach there (like a route unmount or
+   * tab kill), and hand back the checkpoint a reload would find.
+   */
+  const interruptAt = async (
+    input: OptimizerJobInput,
+    jobId: string,
+    stage: OptimizerEvaluation["stage"],
+    dispatchIndex: number
+  ): Promise<OptimizerCheckpoint> => {
+    let seen = 0;
+    const coordinator = new OptimizerCoordinator(input, {}, jobId);
+    onDispatch = (request) => {
+      if (request.stage !== stage) return;
+      seen += 1;
+      if (seen === dispatchIndex) coordinator.detach();
+    };
+    await expect(coordinator.run()).rejects.toThrow(/cancelled/i);
+    await coordinator.settled();
+    onDispatch = null;
+    const latest = savedCheckpoints[savedCheckpoints.length - 1];
+    expect(latest.status).toBe("interrupted");
+    expect(latest.stage).toBe(stage);
+    return latest;
+  };
+
+  const resumeFrom = async (stored: OptimizerCheckpoint) => {
+    const assessment = assessOptimizerCheckpoint(stored);
+    expect(assessment.kind).toBe("resumable");
+    if (assessment.kind !== "resumable") throw new Error("not resumable");
+    const coordinator = new OptimizerCoordinator(
+      assessment.checkpoint.input,
+      {},
+      assessment.checkpoint.jobId
+    );
+    return coordinator.run(assessment.checkpoint);
+  };
+
+  it("resumes an interrupted evolutionary exploration to the identical confirmed frontier", async () => {
+    const input = evolutionaryInput();
+    const uninterrupted = await new OptimizerCoordinator(
+      input,
+      {},
+      "job-evo-straight"
+    ).run();
+    expect(uninterrupted.algorithm).toBe("evolutionary");
+
+    // Interrupt deep enough that at least one later generation exists.
+    const checkpoint = await interruptAt(input, "job-evo-cut", "exploration", 11);
+    expect(checkpoint.evolution).not.toBeNull();
+    expect(checkpoint.evolution!.generation).toBeGreaterThan(0);
+    expect(checkpoint.schemaVersion).toBe(2);
+
+    const dispatchedBefore = dispatched.length;
+    const resumed = await resumeFrom(checkpoint);
+
+    expect(frontier(resumed)).toEqual(frontier(uninterrupted));
+    // Committed evaluations were not recomputed; only pending work ran.
+    const redispatched = dispatched
+      .slice(dispatchedBefore)
+      .filter((request) => request.stage === "exploration")
+      .flatMap((request) => request.candidates.map((c) => c.fingerprint));
+    const committed = new Set(
+      checkpoint.exploration.map((evaluation) => evaluation.candidate.fingerprint)
+    );
+    expect(redispatched.some((fingerprint) => committed.has(fingerprint))).toBe(false);
+    expect(resumed.exploration.length).toBe(uninterrupted.exploration.length);
+  });
+
+  it("resumes an interrupted confirmation to the identical result", async () => {
+    const input = evolutionaryInput();
+    const uninterrupted = await new OptimizerCoordinator(
+      input,
+      {},
+      "job-conf-straight"
+    ).run();
+    // One worker so the second confirmation dispatch follows a committed batch;
+    // the uninterrupted run used two workers, so equality also covers
+    // scheduling independence.
+    const checkpoint = await interruptAt(
+      { ...input, concurrency: 1 },
+      "job-conf-cut",
+      "confirmation",
+      2
+    );
+    expect(checkpoint.evolution).toBeNull();
+    expect(checkpoint.confirmation.length).toBe(4);
+    const resumed = await resumeFrom(checkpoint);
+    expect(frontier(resumed)).toEqual(frontier(uninterrupted));
+  });
+
+  it("resumes a grid job interrupted mid-exploration", async () => {
+    const input = baseInput({ concurrency: 1 });
+    const uninterrupted = await new OptimizerCoordinator(
+      input,
+      {},
+      "job-grid-straight"
+    ).run();
+    expect(uninterrupted.algorithm).toBe("grid");
+    const checkpoint = await interruptAt(input, "job-grid-cut", "exploration", 2);
+    const resumed = await resumeFrom(checkpoint);
+    expect(frontier(resumed)).toEqual(frontier(uninterrupted));
+  });
+
+  it("merges duplicated worker deliveries at most once", async () => {
+    const input = baseInput({ concurrency: 2 });
+    const clean = await new OptimizerCoordinator(input, {}, "job-dup-a").run();
+    workerBehavior.duplicateResponses = true;
+    const progress: OptimizerProgress[] = [];
+    const duplicated = await new OptimizerCoordinator(
+      input,
+      { onProgress: (update) => progress.push(update) },
+      "job-dup-b"
+    ).run();
+    expect(frontier(duplicated)).toEqual(frontier(clean));
+    expect(progress.every((update) => update.evaluated <= update.total)).toBe(true);
+  });
+
+  it("ignores results that arrive after cancellation", async () => {
+    workerBehavior.responseDelayMs = 5;
+    workerBehavior.leakAfterTerminate = true;
+    const progress: OptimizerProgress[] = [];
+    const coordinator = new OptimizerCoordinator(
+      baseInput({ concurrency: 2 }),
+      { onProgress: (update) => progress.push(update) },
+      "job-late"
+    );
+    onDispatch = () => setTimeout(() => coordinator.cancel(), 0);
+    await expect(coordinator.run()).rejects.toThrow(/cancelled/i);
+    const seenAtCancel = progress.length;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(progress.length).toBe(seenAtCancel);
+    await coordinator.settled();
+    expect(savedCheckpoints[savedCheckpoints.length - 1]?.status).toBe(
+      "cancelled"
+    );
+  });
+
+  it("refuses a checkpoint from another engine, schema, or seed bank", async () => {
+    const input = baseInput({ concurrency: 1 });
+    const checkpoint = await interruptAt(input, "job-verify", "exploration", 1);
+    const attempt = (patch: Partial<OptimizerCheckpoint>) =>
+      new OptimizerCoordinator(input, {}, "job-verify").run({
+        ...checkpoint,
+        ...patch,
+      });
+    await expect(attempt({ engineVersion: "other" })).rejects.toThrow(/engine/);
+    await expect(
+      attempt({ schemaVersion: 1 as unknown as 2 })
+    ).rejects.toThrow(/schema/);
+    await expect(
+      attempt({ explorationSeedBankFingerprint: "fnv1a32:0" })
+    ).rejects.toThrow(/seed banks/);
+    await expect(
+      new OptimizerCoordinator(input, {}, "other-job").run(checkpoint)
+    ).rejects.toThrow(/does not match/);
+  });
+
+  it("reports a failed checkpoint write instead of implying the job is saved", async () => {
+    failPersistence = new Error("QuotaExceededError");
+    const states: OptimizerPersistenceState[] = [];
+    let lastProgress: OptimizerProgress | null = null;
+    const summary = await new OptimizerCoordinator(
+      baseInput({ concurrency: 1 }),
+      {
+        onPersistence: (state) => states.push(state),
+        onProgress: (update) => {
+          lastProgress = update;
+        },
+      },
+      "job-storage"
+    ).run();
+    expect(summary.confirmation.length).toBeGreaterThan(0);
+    expect(states.some((state) => state.status === "failed")).toBe(true);
+    expect(states.some((state) => state.status === "saved")).toBe(false);
+    expect(states[states.length - 1]).toMatchObject({
+      status: "failed",
+      error: "QuotaExceededError",
+      savedEvaluations: 0,
+    });
+    expect(lastProgress!.storageError).toBe("QuotaExceededError");
+  });
+
+  it("records saved checkpoints with their committed evaluation count", async () => {
+    const states: OptimizerPersistenceState[] = [];
+    await new OptimizerCoordinator(
+      baseInput({ concurrency: 1 }),
+      { onPersistence: (state) => states.push(state) },
+      "job-saved"
+    ).run();
+    const last = states[states.length - 1];
+    expect(last.status).toBe("saved");
+    expect(last.savedEvaluations).toBeGreaterThan(0);
+    expect(savedCheckpoints[savedCheckpoints.length - 1].status).toBe("complete");
   });
 });

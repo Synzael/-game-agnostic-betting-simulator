@@ -14,19 +14,22 @@ import {
   getAllPresets,
   getAllGames,
   expectedReturnPerUnit,
-  createStrategyFromPreset,
+  resolveSessionPlan,
+  configFromPresetProvenance,
+  findRegisteredGameByFingerprint,
   DEFAULT_SESSION_CONFIG,
   SessionConfig,
+  SessionPlan,
   PresetConfig,
-  DEFAULT_LADDERS,
   formatStake,
 } from "@/engine";
-import type { SavedOptimizerPreset } from "@/engine/optimizer";
 
 interface SetupValidationErrors {
   bankroll?: string;
   profitTarget?: string;
   stopLossAbs?: string;
+  maxRounds?: string;
+  tableMax?: string;
 }
 
 function validateSessionConfig(config: SessionConfig): SetupValidationErrors {
@@ -46,7 +49,31 @@ function validateSessionConfig(config: SessionConfig): SetupValidationErrors {
     errors.stopLossAbs = "Stop loss cannot be greater than bankroll.";
   }
 
+  if (!Number.isInteger(config.maxRounds) || config.maxRounds <= 0) {
+    errors.maxRounds = "Max rounds must be a whole number greater than 0.";
+  }
+
+  if (config.tableMax !== undefined && config.tableMax <= 0) {
+    errors.tableMax = "Table max must be greater than 0, or 0 for no limit.";
+  }
+
   return errors;
+}
+
+const POLICY_LABELS: Record<SessionPlan["strategy"]["bridgingPolicy"], string> =
+  {
+    carry_over_index_delta: "Carry over index delta",
+    advance_to_next_ladder_start: "Advance to next ladder start",
+    stop_at_table_limit: "Stop at table limit",
+  };
+
+function describeOutcomes(plan: SessionPlan): string {
+  return plan.game.betVariant.outcomes
+    .map((outcome) => {
+      const sign = outcome.netPayoutMultiplier > 0 ? "+" : "";
+      return `${outcome.displayName} ${sign}${outcome.netPayoutMultiplier}:1`;
+    })
+    .join(" · ");
 }
 
 export default function SetupPage() {
@@ -82,32 +109,26 @@ export default function SetupPage() {
   const validationErrors = validateSessionConfig(config);
   const hasValidationErrors = Object.keys(validationErrors).length > 0;
 
-  /**
-   * A Lab preset's feasibility was confirmed against one specific objective and
-   * game. Starting it under different settings does not reshape the ladder, so
-   * the confirmed ruin bound would no longer describe what the user is running.
-   */
-  const presetMatchesCurrentSettings = (
-    preset: SavedOptimizerPreset
-  ): boolean => {
-    const { objective, gameFingerprint } = preset.provenance;
-    return (
-      gameFingerprint ===
-        createGameSnapshot(selectedGame.id, selectedVariant.id).fingerprint &&
-      objective.bankroll === config.bankroll &&
-      objective.profitTarget === config.profitTarget &&
-      objective.stopLossAbs === config.stopLossAbs &&
-      objective.maxRounds === config.maxRounds &&
-      (objective.tableMax ?? null) === (config.tableMax ?? null)
-    );
-  };
+  // One resolution feeds both the preview and session creation, so what the
+  // user reads here is exactly what gets frozen into the session.
+  const resolution = resolveSessionPlan({
+    presetId: selectedPreset,
+    customPresets,
+    config,
+    gameId: selectedGame.id,
+    betVariantId: selectedVariant.id,
+  });
+  const plan = resolution.ok ? resolution.plan : null;
+  const planError = resolution.ok ? null : resolution.error;
+  const blockers = plan?.blockers ?? [];
+  const canStart = !hasValidationErrors && plan !== null && blockers.length === 0;
 
   const handlePresetSelect = (preset: PresetConfig) => {
     setSelectedPreset(preset.name);
   };
 
   const handleStartSession = () => {
-    if (hasValidationErrors) {
+    if (!canStart) {
       setShowValidationSummary(true);
       return;
     }
@@ -117,14 +138,8 @@ export default function SetupPage() {
   };
 
   const confirmStartSession = () => {
-    const custom = customPresets.find(
-      (preset) => preset.id === selectedPreset
-    );
-    const strategy = custom
-      ? structuredClone(custom.strategy)
-      : createStrategyFromPreset(selectedPreset);
-    const game = createGameSnapshot(selectedGame.id, selectedVariant.id);
-    startSession(config, strategy, game);
+    if (!plan) return;
+    startSession(plan.config, plan.strategy, plan.game);
     setShowWarningModal(false);
     router.push("/session");
   };
@@ -132,6 +147,28 @@ export default function SetupPage() {
   const updateConfig = (updates: Partial<SessionConfig>) => {
     setConfig((prev) => ({ ...prev, ...updates }));
   };
+
+  const alignWithProvenance = () => {
+    if (!plan || plan.source.kind !== "custom") return;
+    const preset = plan.source.preset;
+    setConfig((prev) => configFromPresetProvenance(preset, prev));
+    const game = findRegisteredGameByFingerprint(
+      preset.provenance.gameFingerprint
+    );
+    if (game) {
+      setSelectedGameId(game.gameId);
+      setSelectedVariantId(game.betVariantId);
+    }
+  };
+
+  const presetSummary = (() => {
+    if (planError) return planError;
+    if (!plan) return null;
+    if (plan.source.kind === "builtin") return plan.source.preset.description;
+    return plan.provenance?.status === "confirmed_for_these_settings"
+      ? "Versioned Ladder Lab result. Its confirmed ruin bound describes this exact setup."
+      : "Confirmed under different settings, so its ruin bound does not describe this setup. See the effective plan below.";
+  })();
 
   return (
     <div className="min-h-screen bg-slate-900 p-4">
@@ -267,20 +304,7 @@ export default function SetupPage() {
               </Card>
             ))}
           </div>
-          <p className="text-xs text-slate-500 mt-2">
-            {(() => {
-              const custom = customPresets.find(
-                (preset) => preset.id === selectedPreset
-              );
-              if (!custom) {
-                return presets.find((p) => p.name === selectedPreset)
-                  ?.description;
-              }
-              return presetMatchesCurrentSettings(custom)
-                ? "Versioned Ladder Lab result with saved optimizer provenance."
-                : "Confirmed under a different game or session settings, so its ruin bound does not describe this setup.";
-            })()}
-          </p>
+          <p className="text-xs text-slate-500 mt-2">{presetSummary}</p>
           {customPresets.length > 0 && (
             <>
               <h3 className="mt-4 mb-2 text-xs uppercase tracking-wide text-slate-500">
@@ -302,10 +326,8 @@ export default function SetupPage() {
                       {preset.displayName}
                     </div>
                     <div className="text-xs text-slate-400 mt-1">
-                      v{preset.version} ·{" "}
-                      {presetMatchesCurrentSettings(preset)
-                        ? "confirmed"
-                        : "confirmed for other settings"}
+                      v{preset.version} · {preset.strategy.ladders.length}{" "}
+                      ladder{preset.strategy.ladders.length === 1 ? "" : "s"}
                     </div>
                   </Card>
                 ))}
@@ -347,6 +369,26 @@ export default function SetupPage() {
               hint="Session ends if you lose this amount"
               error={validationErrors.stopLossAbs}
             />
+            <NumberInput
+              label="Max Rounds"
+              value={config.maxRounds}
+              onChange={(v) => updateConfig({ maxRounds: v })}
+              min={1}
+              step={1}
+              hint="Session ends after this many settled rounds"
+              error={validationErrors.maxRounds}
+            />
+            <NumberInput
+              label="Table Max"
+              value={config.tableMax ?? 0}
+              onChange={(v) =>
+                updateConfig({ tableMax: v > 0 ? v : undefined })
+              }
+              min={0}
+              prefix="$"
+              hint="0 = no table limit. A required stake above this ends the session."
+              error={validationErrors.tableMax}
+            />
           </div>
         </div>
 
@@ -355,29 +397,194 @@ export default function SetupPage() {
           <h2 className="text-sm text-slate-400 uppercase tracking-wide mb-3">
             Starting Ladder
           </h2>
-          <div className="grid grid-cols-3 gap-2">
-            {DEFAULT_LADDERS.map((ladder, index) => {
-              const minStake = ladder.stakes[0];
-              const maxStake = ladder.stakes[ladder.stakes.length - 1];
-              return (
-                <Card
-                  key={ladder.name}
-                  variant={config.startingLadder === index ? "info" : "default"}
-                  interactive
-                  selected={config.startingLadder === index}
-                  className="p-3"
-                  onClick={() => updateConfig({ startingLadder: index })}
-                >
-                  <div className="font-medium text-white text-sm">
-                    {ladder.name}
+          {plan ? (
+            <div className="grid grid-cols-3 gap-2">
+              {plan.strategy.ladders.map((ladder, index) => {
+                const minStake = ladder.stakes[0];
+                const maxStake = ladder.stakes[ladder.stakes.length - 1];
+                const selected = plan.config.startingLadder === index;
+                return (
+                  <Card
+                    key={ladder.name}
+                    variant={selected ? "info" : "default"}
+                    interactive
+                    selected={selected}
+                    className="p-3"
+                    onClick={() => updateConfig({ startingLadder: index })}
+                  >
+                    <div className="font-medium text-white text-sm">
+                      {ladder.name}
+                    </div>
+                    <div className="text-xs text-slate-400 mt-1">
+                      {formatStake(minStake)} – {formatStake(maxStake)}
+                    </div>
+                    <div className="text-xs text-slate-500 mt-1">
+                      {ladder.stakes.length} steps
+                    </div>
+                  </Card>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="text-xs text-slate-500">
+              Choose an available preset to preview its ladders.
+            </p>
+          )}
+        </div>
+
+        {/* Effective plan */}
+        <div>
+          <h2 className="text-sm text-slate-400 uppercase tracking-wide mb-3">
+            Effective Session Plan
+          </h2>
+          {plan ? (
+            <Card className="p-4 space-y-4" data-testid="effective-plan">
+              <p className="text-xs text-slate-400">
+                These are the exact values frozen into the session when you
+                start. They come from the selected preset and the settings
+                above.
+              </p>
+              <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
+                <dt className="text-slate-500">Preset</dt>
+                <dd className="text-slate-200 text-right">
+                  {plan.source.kind === "builtin"
+                    ? `${plan.source.preset.displayName} (built-in)`
+                    : `${plan.source.preset.displayName} (Ladder Lab v${plan.source.preset.version})`}
+                </dd>
+                <dt className="text-slate-500">Game</dt>
+                <dd className="text-slate-200 text-right">
+                  {plan.game.gameDisplayName} · {plan.game.betVariant.displayName}
+                </dd>
+                <dt className="text-slate-500">Payouts</dt>
+                <dd className="text-slate-200 text-right">
+                  {describeOutcomes(plan)}
+                </dd>
+                <dt className="text-slate-500">Bankroll / target / stop</dt>
+                <dd className="text-slate-200 text-right">
+                  {formatStake(plan.config.bankroll)} /{" "}
+                  {formatStake(plan.config.profitTarget)} /{" "}
+                  {formatStake(plan.config.stopLossAbs)}
+                </dd>
+                <dt className="text-slate-500">Max rounds</dt>
+                <dd className="text-slate-200 text-right">
+                  {plan.config.maxRounds}
+                </dd>
+                <dt className="text-slate-500">Table max</dt>
+                <dd className="text-slate-200 text-right">
+                  {plan.config.tableMax === undefined
+                    ? "none"
+                    : formatStake(plan.config.tableMax)}
+                </dd>
+                <dt className="text-slate-500">Bridging</dt>
+                <dd className="text-slate-200 text-right">
+                  {POLICY_LABELS[plan.strategy.bridgingPolicy]} ·{" "}
+                  {Math.round(plan.strategy.recoveryTargetPct * 100)}% recovery
+                  · offset {plan.strategy.crossoverOffset}
+                </dd>
+                <dt className="text-slate-500">First stake</dt>
+                <dd className="text-slate-200 text-right">
+                  {formatStake(plan.firstStake)} on{" "}
+                  {plan.strategy.ladders[plan.config.startingLadder].name}
+                </dd>
+                <dt className="text-slate-500">Highest stake</dt>
+                <dd className="text-slate-200 text-right">
+                  {formatStake(plan.highestStake)}
+                </dd>
+              </dl>
+
+              <div>
+                <div className="text-xs text-slate-500 mb-1">Ladders</div>
+                <ul className="space-y-1 text-xs text-slate-300">
+                  {plan.strategy.ladders.map((ladder) => (
+                    <li key={ladder.name}>
+                      <span className="text-slate-400">{ladder.name}:</span>{" "}
+                      {ladder.stakes.map(formatStake).join(" · ")}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+
+              {plan.adjustments.length > 0 && (
+                <div role="note" className="text-xs text-amber-200">
+                  <div className="font-medium">Adjusted before start</div>
+                  <ul className="mt-1 space-y-1">
+                    {plan.adjustments.map((adjustment) => (
+                      <li key={adjustment.field}>
+                        {adjustment.label}: saved {adjustment.saved}, effective{" "}
+                        {adjustment.effective}. {adjustment.reason}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {plan.provenance && (
+                <div className="border-t border-slate-700 pt-3 text-xs">
+                  <div className="font-medium text-slate-200">
+                    {plan.provenance.status === "confirmed_for_these_settings"
+                      ? "Confirmed for these settings"
+                      : "Confirmed for other settings"}
                   </div>
-                  <div className="text-xs text-slate-400 mt-1">
-                    {formatStake(minStake)} – {formatStake(maxStake)}
-                  </div>
-                </Card>
-              );
-            })}
-          </div>
+                  <p className="mt-1 text-slate-400">
+                    Holdout confirmation: target lower bound{" "}
+                    {(plan.provenance.targetLowerBound * 100).toFixed(1)}%,
+                    ruin upper bound{" "}
+                    {(plan.provenance.ruinUpperBound * 100).toFixed(1)}% at{" "}
+                    {Math.round(plan.provenance.confidenceLevel * 100)}%
+                    confidence over {plan.provenance.sampleCount} modeled
+                    sessions ({plan.provenance.engineVersion}). This is a
+                    modeled bound under the confirmed assumptions, not a
+                    guarantee.
+                  </p>
+                  {plan.provenance.mismatches.length > 0 && (
+                    <>
+                      <p className="mt-2 text-amber-200">
+                        The session below differs from the confirmed candidate,
+                        so that bound does not apply to it:
+                      </p>
+                      <ul className="mt-1 space-y-1 text-slate-300">
+                        {plan.provenance.mismatches.map((mismatch) => (
+                          <li key={mismatch.field}>
+                            {mismatch.field}: confirmed {mismatch.confirmed},
+                            now {mismatch.current}
+                          </li>
+                        ))}
+                      </ul>
+                      {plan.provenance.mismatches.some(
+                        (mismatch) => mismatch.field !== "Ladder fingerprint"
+                      ) && (
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          className="mt-3"
+                          onClick={alignWithProvenance}
+                        >
+                          Use confirmed settings
+                        </Button>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+
+              {blockers.length > 0 && (
+                <div role="alert" className="text-xs text-red-300">
+                  <div className="font-medium">Cannot start as configured</div>
+                  <ul className="mt-1 space-y-1">
+                    {blockers.map((blocker) => (
+                      <li key={blocker}>{blocker}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </Card>
+          ) : (
+            <Card variant="danger" className="p-4">
+              <p role="alert" className="text-xs text-red-200">
+                {planError}
+              </p>
+            </Card>
+          )}
         </div>
 
         {/* Decision Mode */}
@@ -442,9 +649,12 @@ export default function SetupPage() {
         </div>
 
         {/* Start Button */}
-        {showValidationSummary && hasValidationErrors && (
-          <p className="text-sm text-red-400">
-            Please fix invalid session settings before starting.
+        {showValidationSummary && !canStart && (
+          <p className="text-sm text-red-400" role="alert">
+            {hasValidationErrors
+              ? "Please fix invalid session settings before starting."
+              : planError ??
+                "Resolve the effective plan problems above before starting."}
           </p>
         )}
         <Button
