@@ -72,10 +72,11 @@ export function getTotalStakes(ladders: readonly LadderSpec[]): number {
  * Format stake as currency string.
  */
 export function formatStake(stake: number): string {
+  const hasCents = Math.abs(stake * 100 - Math.round(stake) * 100) > 0.001;
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency: "USD",
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 0,
+    minimumFractionDigits: hasCents ? 2 : 0,
+    maximumFractionDigits: 2,
   }).format(stake);
 }

@@ -64,7 +64,7 @@ export default function CardCountingPage() {
   const [accessReady, setAccessReady] = useState(false);
   useEffect(() => {
     if (useCardCountingAccessStore.persist.hasHydrated()) {
-      setAccessReady(true);
+      queueMicrotask(() => setAccessReady(true));
       return;
     }
     return useCardCountingAccessStore.persist.onFinishHydration(() =>

@@ -16,19 +16,33 @@ import {
   SessionEvent,
   SessionResult,
   DecisionMode,
+  FrozenGameSnapshot,
+  RecordedOutcome,
+  VarianceForecast,
 } from "@/engine/types";
 import {
   createInitialState,
-  processBet,
+  processOutcome,
   processBridgingDecision,
   getCurrentStake as getStake,
   canAffordStake,
 } from "@/engine/session";
+import {
+  createDefaultGameSnapshot,
+  createLegacyGameSnapshot,
+  migrateLegacyBetRecords,
+  createRecordedOutcome,
+  resolveOutcomeSpec,
+  settleOutcome,
+} from "@/engine/games";
+
+export type ForecastStatus = "idle" | "modeling" | "ready" | "error";
 
 interface SessionStore {
   // Configuration
   config: SessionConfig | null;
   strategy: StrategyConfig | null;
+  game: FrozenGameSnapshot | null;
   decisionMode: DecisionMode;
 
   // Active session state
@@ -36,14 +50,24 @@ interface SessionStore {
   betHistory: BetRecord[];
   sessionEvents: SessionEvent[];
   startTime: number | null;
+  completedResult: SessionResult | null;
+  varianceForecast: VarianceForecast | null;
+  forecastStatus: ForecastStatus;
 
   // Actions
-  startSession: (config: SessionConfig, strategy: StrategyConfig) => void;
+  startSession: (
+    config: SessionConfig,
+    strategy: StrategyConfig,
+    game?: FrozenGameSnapshot
+  ) => void;
+  recordOutcome: (outcome: RecordedOutcome | string) => void;
   recordBet: (won: boolean) => void;
   makeDecision: (decision: BridgingDecision) => void;
   endSession: () => SessionResult | null;
   resetSession: () => void;
   setDecisionMode: (mode: DecisionMode) => void;
+  setVarianceForecast: (forecast: VarianceForecast) => void;
+  setForecastStatus: (status: ForecastStatus) => void;
 
   // Computed helpers
   getCurrentStake: () => number;
@@ -57,41 +81,66 @@ export const useSessionStore = create<SessionStore>()(
     (set, get) => ({
       config: null,
       strategy: null,
+      game: null,
       decisionMode: "at_bridging_only",
       state: null,
       betHistory: [],
       sessionEvents: [],
       startTime: null,
+      completedResult: null,
+      varianceForecast: null,
+      forecastStatus: "idle",
 
-      startSession: (config, strategy) => {
+      startSession: (config, strategy, game = createDefaultGameSnapshot()) => {
         set({
           config,
           strategy,
+          game,
           state: createInitialState(strategy, config.startingLadder),
           betHistory: [],
           sessionEvents: [],
           startTime: Date.now(),
+          completedResult: null,
+          varianceForecast: null,
+          forecastStatus: "idle",
         });
       },
 
-      recordBet: (won) => {
-        const { state, config, strategy, betHistory, decisionMode } = get();
-        if (!state || !config || !strategy || state.stopped) return;
+      recordOutcome: (outcomeInput) => {
+        const {
+          state,
+          config,
+          strategy,
+          game,
+          betHistory,
+          decisionMode,
+        } = get();
+        if (!state || !config || !strategy || !game || state.stopped) return;
 
-        // Check affordability
-        if (!canAffordStake(state, config, strategy)) {
-          set({
-            state: {
-              ...state,
-              stopped: true,
-              stopReason: "bankroll_exhausted",
-            },
-          });
+        const stake = getStake(state, strategy);
+        const outcome =
+          typeof outcomeInput === "string"
+            ? createRecordedOutcome(game, outcomeInput)
+            : outcomeInput;
+        const newState = processOutcome(
+          state,
+          config,
+          strategy,
+          game,
+          outcome,
+          decisionMode
+        );
+
+        // The engine refuses rounds it cannot settle (awaiting a decision,
+        // table limit, bankroll exhausted) and leaves `rounds` untouched.
+        // Committing a bet record for those would desync betHistory from state.
+        if (newState.rounds === state.rounds) {
+          if (newState !== state) set({ state: newState, completedResult: null });
           return;
         }
 
-        const stake = getStake(state, strategy);
-        const newState = processBet(state, config, strategy, won, decisionMode);
+        const outcomeSpec = resolveOutcomeSpec(game, outcome);
+        const settledPnl = settleOutcome(stake, game, outcome);
 
         // Record bet history
         const newRecord: BetRecord = {
@@ -100,14 +149,29 @@ export const useSessionStore = create<SessionStore>()(
           ladder: state.currentLadder,
           index: state.currentIndex,
           stake,
-          won,
+          outcome,
+          outcomeDisplayName: outcomeSpec.displayName,
+          progressionEffect: outcomeSpec.progressionEffect,
+          settledPnl,
           pnlAfter: newState.pnl,
         };
 
         set({
           state: newState,
           betHistory: [...betHistory, newRecord],
+          completedResult: null,
         });
+      },
+
+      /** Compatibility adapter for boolean callers; production uses recordOutcome. */
+      recordBet: (won) => {
+        const game = get().game ?? createDefaultGameSnapshot();
+        const outcomeId = game.betVariant.outcomes.find(
+          (outcome) =>
+            outcome.progressionEffect === (won ? "win" : "loss")
+        )?.id;
+        if (!outcomeId) return;
+        get().recordOutcome(outcomeId);
       },
 
       makeDecision: (decision) => {
@@ -137,13 +201,28 @@ export const useSessionStore = create<SessionStore>()(
         set({
           state: newState,
           sessionEvents: newEvent ? [...sessionEvents, newEvent] : sessionEvents,
+          completedResult: null,
         });
       },
 
       endSession: () => {
-        const { state, config, strategy, betHistory, sessionEvents, startTime } =
-          get();
-        if (!state || !config || !strategy) return null;
+        const {
+          state,
+          config,
+          strategy,
+          betHistory,
+          sessionEvents,
+          startTime,
+          completedResult,
+          game,
+          varianceForecast,
+        } = get();
+        if (!state || !config || !strategy || !game) return null;
+        if (completedResult) {
+          return completedResult.game
+            ? completedResult
+            : { ...completedResult, game };
+        }
 
         const result: SessionResult = {
           id: crypto.randomUUID(),
@@ -166,10 +245,13 @@ export const useSessionStore = create<SessionStore>()(
           finalIndex: state.currentIndex,
           config,
           strategy,
+          game,
           betHistory,
           events: sessionEvents,
+          forecastSnapshot: varianceForecast ?? undefined,
         };
 
+        set({ completedResult: result });
         return result;
       },
 
@@ -177,15 +259,37 @@ export const useSessionStore = create<SessionStore>()(
         set({
           config: null,
           strategy: null,
+          game: null,
           state: null,
           betHistory: [],
           sessionEvents: [],
           startTime: null,
+          completedResult: null,
+          varianceForecast: null,
+          forecastStatus: "idle",
         });
       },
 
       setDecisionMode: (mode) => {
         set({ decisionMode: mode });
+      },
+
+      setVarianceForecast: (forecast) => {
+        set((current) => ({
+          varianceForecast: forecast,
+          forecastStatus:
+            forecast.quality === "full" ? "ready" : "modeling",
+          completedResult: current.completedResult
+            ? {
+                ...current.completedResult,
+                forecastSnapshot: forecast,
+              }
+            : null,
+        }));
+      },
+
+      setForecastStatus: (status) => {
+        set({ forecastStatus: status });
       },
 
       getCurrentStake: () => {
@@ -213,16 +317,63 @@ export const useSessionStore = create<SessionStore>()(
     }),
     {
       name: "betting-session:v1",
+      version: 2,
       storage: createJSONStorage(() => localStorage),
+      migrate: (persistedState, version) => {
+        if (version >= 2) return persistedState as SessionStore;
+        return migrateLegacySessionStore(
+          persistedState as Partial<SessionStore>
+        ) as SessionStore;
+      },
       partialize: (state) => ({
         config: state.config,
         strategy: state.strategy,
+        game: state.game,
         state: state.state,
         betHistory: state.betHistory,
         sessionEvents: state.sessionEvents,
         startTime: state.startTime,
+        completedResult: state.completedResult,
         decisionMode: state.decisionMode,
+        // The forecast is a large blob of band points and is deterministically
+        // recomputable, so it is not written on every recorded bet. A stopped
+        // session can no longer recompute it, so that one is kept.
+        varianceForecast: state.state?.stopped
+          ? state.varianceForecast
+          : null,
+        forecastStatus: state.forecastStatus,
       }),
     }
   )
 );
+
+function migrateLegacySessionStore(
+  persisted: Partial<SessionStore>
+): Partial<SessionStore> {
+  const game = persisted.game ?? createLegacyGameSnapshot();
+  const betHistory = migrateLegacyBetRecords(persisted.betHistory ?? [], game);
+
+  const state = persisted.state
+    ? {
+        ...persisted.state,
+        winCount:
+          persisted.state.winCount ??
+          betHistory.filter((bet) => bet.progressionEffect === "win").length,
+        lossCount:
+          persisted.state.lossCount ??
+          betHistory.filter((bet) => bet.progressionEffect === "loss").length,
+        pushCount:
+          persisted.state.pushCount ??
+          betHistory.filter((bet) => bet.progressionEffect === "neutral").length,
+      }
+    : null;
+
+  return {
+    ...persisted,
+    game,
+    state,
+    betHistory,
+    varianceForecast: persisted.varianceForecast ?? null,
+    forecastStatus: persisted.varianceForecast ? "ready" : "idle",
+  };
+}

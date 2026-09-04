@@ -170,8 +170,8 @@ describe('formatStake', () => {
     expect(formatStake(-1500)).toBe('-$1,500');
   });
 
-  it('rounds decimals to whole numbers', () => {
-    expect(formatStake(99.99)).toBe('$100');
-    expect(formatStake(100.01)).toBe('$100');
+  it('preserves cents for non-whole payouts', () => {
+    expect(formatStake(99.99)).toBe('$99.99');
+    expect(formatStake(100.01)).toBe('$100.01');
   });
 });

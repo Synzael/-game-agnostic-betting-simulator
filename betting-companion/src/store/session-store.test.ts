@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { useSessionStore } from './session-store';
 import { SessionConfig, StrategyConfig } from '@/engine/types';
 import { createLadder } from '@/engine/ladder';
+import { createGameSnapshot } from '@/engine/games';
 
 // Test fixtures
 const createTestConfig = (): SessionConfig => ({
@@ -96,6 +97,60 @@ describe('useSessionStore', () => {
     });
   });
 
+  describe('rounds the engine refuses', () => {
+    it('records no bet when the stake exceeds the table maximum', () => {
+      // Ladder starts at 10 with a table max of 5: the engine refuses the
+      // round outright, so no settled bet may enter betHistory.
+      const config = { ...createTestConfig(), tableMax: 5 };
+      useSessionStore.getState().startSession(config, createTestStrategy());
+
+      useSessionStore.getState().recordOutcome('win');
+
+      const { state, betHistory } = useSessionStore.getState();
+      expect(state?.stopped).toBe(true);
+      expect(state?.stopReason).toBe('table_limit');
+      expect(state?.rounds).toBe(0);
+      expect(state?.pnl).toBe(0);
+      expect(betHistory).toHaveLength(0);
+    });
+
+    it('records no bet when the session is awaiting a decision', () => {
+      useSessionStore
+        .getState()
+        .startSession(createTestConfig(), createTestStrategy());
+      useSessionStore.setState((prev) => ({
+        ...prev,
+        state: prev.state
+          ? {
+              ...prev.state,
+              awaitingDecision: true,
+              pendingDecisionType: 'bridging',
+            }
+          : null,
+      }));
+      const before = useSessionStore.getState().state;
+
+      useSessionStore.getState().recordOutcome('win');
+
+      const { state, betHistory } = useSessionStore.getState();
+      expect(betHistory).toHaveLength(0);
+      expect(state?.rounds).toBe(before?.rounds);
+      expect(state?.pnl).toBe(before?.pnl);
+    });
+
+    it('records no bet when the bankroll cannot cover the stake', () => {
+      const config = { ...createTestConfig(), bankroll: 1 };
+      useSessionStore.getState().startSession(config, createTestStrategy());
+
+      useSessionStore.getState().recordOutcome('loss');
+
+      const { state, betHistory } = useSessionStore.getState();
+      expect(state?.stopped).toBe(true);
+      expect(state?.stopReason).toBe('bankroll_exhausted');
+      expect(betHistory).toHaveLength(0);
+    });
+  });
+
   describe('recordBet', () => {
     beforeEach(() => {
       const config = createTestConfig();
@@ -110,7 +165,8 @@ describe('useSessionStore', () => {
       expect(state?.pnl).toBe(10); // stake at index 0 is 10
       expect(state?.rounds).toBe(1);
       expect(betHistory.length).toBe(1);
-      expect(betHistory[0].won).toBe(true);
+      expect(betHistory[0].progressionEffect).toBe('win');
+      expect(betHistory[0].outcome?.outcomeId).toBe('win');
       expect(betHistory[0].stake).toBe(10);
     });
 
@@ -121,7 +177,8 @@ describe('useSessionStore', () => {
       expect(state?.pnl).toBe(-10);
       expect(state?.rounds).toBe(1);
       expect(betHistory.length).toBe(1);
-      expect(betHistory[0].won).toBe(false);
+      expect(betHistory[0].progressionEffect).toBe('loss');
+      expect(betHistory[0].outcome?.outcomeId).toBe('loss');
     });
 
     it('does nothing if session stopped', () => {
@@ -170,6 +227,30 @@ describe('useSessionStore', () => {
       expect(betHistory[0].round).toBe(1);
       expect(betHistory[1].round).toBe(2);
       expect(betHistory[2].round).toBe(3);
+    });
+  });
+
+  describe('typed multi-game outcomes', () => {
+    it('records Banker commission and tie without boolean production fields', () => {
+      const game = createGameSnapshot(
+        'baccarat_standard_8_deck',
+        'banker_5pct_commission'
+      );
+      useSessionStore
+        .getState()
+        .startSession(createTestConfig(), createTestStrategy(), game);
+      useSessionStore.getState().recordOutcome('banker_win');
+      useSessionStore.getState().recordOutcome('tie');
+
+      const { state, betHistory } = useSessionStore.getState();
+      expect(state?.pnl).toBe(9.5);
+      expect(state?.rounds).toBe(2);
+      expect(state?.winCount).toBe(1);
+      expect(state?.pushCount).toBe(1);
+      expect(betHistory[0].settledPnl).toBe(9.5);
+      expect(betHistory[1].settledPnl).toBe(0);
+      expect(betHistory[1].progressionEffect).toBe('neutral');
+      expect(betHistory[1].won).toBeUndefined();
     });
   });
 

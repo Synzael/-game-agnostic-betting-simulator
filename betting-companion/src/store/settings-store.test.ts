@@ -3,7 +3,10 @@ import { useSettingsStore } from './settings-store';
 
 describe('useSettingsStore', () => {
   beforeEach(() => {
-    useSettingsStore.setState({ showBetNumbers: true });
+    useSettingsStore.setState({
+      showBetNumbers: true,
+      showVarianceFan: true,
+    });
   });
 
   it('shows bet numbers by default', () => {
@@ -23,5 +26,11 @@ describe('useSettingsStore', () => {
 
   it('persists under the app-settings key', () => {
     expect(useSettingsStore.persist.getOptions().name).toBe('app-settings:v1');
+  });
+
+  it('toggles the variance fan independently of its session snapshot', () => {
+    useSettingsStore.getState().setShowVarianceFan(false);
+    expect(useSettingsStore.getState().showVarianceFan).toBe(false);
+    expect(useSettingsStore.getState().showBetNumbers).toBe(true);
   });
 });

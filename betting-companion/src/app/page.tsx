@@ -6,14 +6,17 @@ import { Capacitor } from "@capacitor/core";
 import {
   useSessionStore,
   useHistoryStore,
+  useVaultStore,
   usePremiumStore,
   useCardCountingAccessStore,
 } from "@/store";
 import { calculateHistoryStats } from "@/store/history-store";
 import { hasPremiumEntitlement } from "@/store/premium-store";
 import { fetchWhitelist } from "@/lib/card-counting-access";
+import { useInitializeVault } from "@/components/vault";
 
 export default function Home() {
+  useInitializeVault();
   const isSessionActive = useSessionStore((s) => s.isSessionActive);
   const sessions = useHistoryStore((s) => s.sessions);
   const isPremium = usePremiumStore((s) => s.isPremium);
@@ -155,6 +158,55 @@ export default function Home() {
                 </div>
                 <div className="text-xs text-secondary mt-0.5">
                   View past sessions and stats
+                </div>
+              </div>
+            </div>
+          </div>
+        </Link>
+
+        {/* Vault */}
+        <Link href={premiumRequired ? "/premium" : "/vault"} className="block animate-fadeInUp stagger-3">
+          <div
+            className={`card-gold p-5 group cursor-pointer transition-all duration-300 hover:scale-[1.02] ${
+              premiumRequired ? "opacity-60" : ""
+            }`}
+          >
+            <div className="flex items-center gap-4">
+              <div className="w-14 h-14 rotate-45 border border-[var(--gold-dim)] bg-[var(--gold-glow)] flex items-center justify-center">
+                <svg className="w-7 h-7 -rotate-45 text-gold" fill="none" viewBox="0 0 24 24">
+                  <path d="M7 4h10v4c0 3-2 5-5 5s-5-2-5-5V4Z" stroke="currentColor" strokeWidth="1.5" />
+                  <path d="M7 6H4v2c0 2 1.5 3 4 3m9-5h3v2c0 2-1.5 3-4 3M12 13v4m-4 3h8m-6-3h4" stroke="currentColor" strokeWidth="1.5" />
+                </svg>
+              </div>
+              <div>
+                <div className="font-display text-xl text-gold">
+                  The Vault
+                </div>
+                <div className="text-xs text-secondary mt-0.5">
+                  Preserved records and trophy sessions
+                </div>
+              </div>
+            </div>
+          </div>
+        </Link>
+
+        {/* Ladder Lab */}
+        <Link href={premiumRequired ? "/premium" : "/optimizer"} className="block animate-fadeInUp stagger-3">
+          <div
+            className={`card-noir p-5 group cursor-pointer transition-all duration-300 hover:scale-[1.02] hover:border-[var(--gold-dim)] ${
+              premiumRequired ? "opacity-60" : ""
+            }`}
+          >
+            <div className="flex items-center gap-4">
+              <div className="w-14 h-14 rounded-xl bg-[var(--gold-glow)] flex items-center justify-center">
+                <span className="font-display text-2xl text-gold">∑</span>
+              </div>
+              <div>
+                <div className="font-display text-xl text-champagne">
+                  Ladder Lab
+                </div>
+                <div className="text-xs text-secondary mt-0.5">
+                  Search ladder shapes under a fixed risk tolerance
                 </div>
               </div>
             </div>

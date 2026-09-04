@@ -1,17 +1,20 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { useHistoryStore } from "@/store";
+import { useHistoryStore, useSettingsStore, useVaultStore } from "@/store";
 import { Button, Card, CardContent } from "@/components/ui";
 import { formatStake } from "@/engine";
 import { calculateHistoryStats } from "@/store/history-store";
 import { SessionGraph, stopReasonFromResult } from "@/components/graph";
+import { useInitializeVault } from "@/components/vault";
 
 export default function HistoryPage() {
+  useInitializeVault();
   const sessions = useHistoryStore((s) => s.sessions);
   const clearHistory = useHistoryStore((s) => s.clearHistory);
   const removeSession = useHistoryStore((s) => s.removeSession);
+  const showVarianceFan = useSettingsStore((s) => s.showVarianceFan) ?? true;
   const [showConfirmClear, setShowConfirmClear] = useState(false);
 
   const stats = useMemo(() => calculateHistoryStats(sessions), [sessions]);
@@ -70,6 +73,7 @@ export default function HistoryPage() {
           <CardContent>
             <p className="text-white mb-4">
               Clear all {sessions.length} sessions? This cannot be undone.
+              Vault trophies are preserved separately.
             </p>
             <div className="flex gap-2">
               <Button
@@ -155,6 +159,12 @@ export default function HistoryPage() {
                     <div className="text-xs text-slate-500 mb-1">
                       {formatDate(session.startTime)}
                     </div>
+                    {session.game && (
+                      <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
+                        {session.game.gameDisplayName} ·{" "}
+                        {session.game.betVariant.displayName}
+                      </div>
+                    )}
                     <div
                       className={`text-xl font-bold ${
                         session.finalPnl >= 0 ? "text-green-400" : "text-red-400"
@@ -185,6 +195,8 @@ export default function HistoryPage() {
                       betHistory={session.betHistory}
                       events={session.events}
                       stopReason={stopReasonFromResult(session)}
+                      varianceForecast={session.forecastSnapshot}
+                      showVarianceFan={showVarianceFan}
                       showBetNumbers={false}
                       height={70}
                     />
@@ -205,6 +217,9 @@ export default function HistoryPage() {
 
       {/* Footer */}
       <div className="mt-8 text-center">
+        <Link href="/vault" className="mr-3">
+          <Button variant="gold">Open the Vault</Button>
+        </Link>
         <Link href="/">
           <Button variant="ghost">Back Home</Button>
         </Link>
